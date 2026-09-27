@@ -422,8 +422,64 @@ fn dispatch_operation(env: &Env, target: &Address, op: CallData) -> Result<(), G
 
 const INSTANCE_LIFETIME_THRESHOLD: u32 = 17_280;
 const INSTANCE_BUMP_AMOUNT: u32 = 120_960;
+/// Threshold below which a proposal-scoped entry is topped up. The bump amount
+/// that goes with it is chosen per lifecycle state by the #52 retention policy
+/// ([`ACTIVE_PROPOSAL_BUMP_AMOUNT`] / [`TERMINAL_PROPOSAL_RETENTION`]),
+/// so there is deliberately no single persistent bump constant any more.
 const PERSISTENT_LIFETIME_THRESHOLD: u32 = 17_280;
-const PERSISTENT_BUMP_AMOUNT: u32 = 120_960;
+
+// ---------------------------------------------------------------------------
+// Proposal retention policy (#52)
+// ---------------------------------------------------------------------------
+
+/// Seconds per ledger on Stellar. TTL arguments are denominated in **ledgers**,
+/// not seconds, so every retention window below is converted from its
+/// wall-clock intent through this constant.
+const SECONDS_PER_LEDGER: u64 = 5;
+
+/// Convert a wall-clock window in seconds into the ledger count the host expects.
+///
+/// Saturating rather than wrapping: a misconfigured constant should clamp to the
+/// network maximum and trip the bounds test below, not silently wrap into a
+/// negative-length window.
+const fn ledgers(seconds: u64) -> u32 {
+    let count = seconds / SECONDS_PER_LEDGER;
+    if count > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        count as u32
+    }
+}
+
+/// TTL bump applied to a proposal-scoped entry while the proposal is still
+/// **active** (`Proposed` / `Approved` / `Queued`).
+///
+/// A proposal is never useful past `created_at + MAX_PROPOSAL_AGE_SECONDS`
+/// (30 days): `approve` and `execute` both reject it as `ProposalExpired` after
+/// that, and the quorum and grace windows are sized to land inside the same
+/// bound. Bumping past that whole span means one bump carries the entry beyond
+/// the last moment it could legally be read or written, so an active proposal
+/// cannot archive while it is still executable however long signers wait.
+///
+/// The extra week over `MAX_PROPOSAL_AGE_SECONDS` is deliberate headroom: the
+/// worst case is a bump landing exactly at `created_at`, after which the entry
+/// must survive one full max-age window. Remaining under the network's
+/// `max_entry_ttl` (6_312_000 ledgers, about a year) is asserted by
+/// `test_retention_windows_stay_within_network_limits`.
+const ACTIVE_PROPOSAL_BUMP_AMOUNT: u32 = ledgers(MAX_PROPOSAL_AGE_SECONDS + 604_800);
+
+/// Retention floor granted to a proposal that has just reached a **terminal**
+/// state (`Executed` / `Cancelled`).
+///
+/// Applied exactly once, at the moment the proposal becomes terminal, and never
+/// again. 30 days is the standard archival floor: long enough for indexers and
+/// auditors to reconcile the proposal against the events it emitted, after
+/// which the entry is left to decay back to the ledger's minimum rent instead of
+/// being held alive indefinitely by later reads.
+///
+/// Because the floor is never topped up, a terminal proposal's storage cost
+/// falls to zero once the window elapses — see `docs/governance-storage.md`.
+const TERMINAL_PROPOSAL_RETENTION: u32 = ledgers(2_592_000);
 
 // ---------------------------------------------------------------------------
 // Events
@@ -590,28 +646,100 @@ fn bump_instance(env: &Env) {
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 }
 
-fn bump_proposal(env: &Env, id: u32) {
-    env.storage().persistent().extend_ttl(
-        &DataKey::Proposal(id),
-        PERSISTENT_LIFETIME_THRESHOLD,
-        PERSISTENT_BUMP_AMOUNT,
-    );
+/// `true` once a proposal can never change state again.
+///
+/// Terminal proposals are the ones the retention policy stops paying for: they
+/// get a one-shot archival floor when they terminate and are never topped up
+/// again, so their rent decays instead of growing without bound (#52).
+fn is_terminal(status: &ProposalStatus) -> bool {
+    matches!(
+        status,
+        ProposalStatus::Executed | ProposalStatus::Cancelled
+    )
 }
 
-/// Extends the TTL of the QuorumReachedAt entry so it outlives the timelock.
-/// Called on every approve and execute to prevent archival before execution.
-fn bump_quorum_ttl(env: &Env, id: u32) {
-    if env
-        .storage()
-        .persistent()
-        .has(&DataKey::QuorumReachedAt(id))
-    {
+/// Apply the #52 retention policy to a single proposal-scoped persistent entry.
+///
+/// **Active** proposals are extended past their own maximum possible lifetime
+/// ([`ACTIVE_PROPOSAL_BUMP_AMOUNT`]), so a proposal that is still collecting
+/// votes — or queued behind its timelock — cannot archive before it is acted
+/// on, however long signers wait between votes.
+///
+/// **Terminal** proposals are skipped entirely. Their one-shot 30-day floor was
+/// already granted by [`seal_terminal_proposal`] at the transition, and topping
+/// it up again on every subsequent read is exactly the unbounded rent growth
+/// this policy exists to prevent.
+fn bump_active_entry(env: &Env, key: &DataKey, status: &ProposalStatus) {
+    if is_terminal(status) {
+        return;
+    }
+    // The host treats extending a non-existent or already-archived entry as an
+    // error, not a no-op, so every key is probed first. A proposal that has not
+    // reached quorum has no `QuorumReachedAt` entry, and one that has never
+    // been approved has no `ProposalApprovalIdx`.
+    if env.storage().persistent().has(key) {
         env.storage().persistent().extend_ttl(
-            &DataKey::QuorumReachedAt(id),
+            key,
             PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
+            ACTIVE_PROPOSAL_BUMP_AMOUNT,
         );
     }
+}
+
+/// Apply [`bump_active_entry`] to every persistent key a proposal owns.
+///
+/// A proposal's storage is three entries — the record itself, the quorum
+/// snapshot, and the duplicate-approval index. They are read and written
+/// together and share a lifetime, so they share one policy: keeping the record
+/// alive while the index or the quorum snapshot decays would corrupt the
+/// duplicate-approval check or the execution gates.
+fn bump_proposal_retention(env: &Env, id: u32, status: &ProposalStatus) {
+    bump_active_entry(env, &DataKey::Proposal(id), status);
+    bump_active_entry(env, &DataKey::QuorumReachedAt(id), status);
+    bump_active_entry(env, &DataKey::ProposalApprovalIdx(id), status);
+}
+
+/// Grant a proposal's storage the one-shot terminal retention floor (#52).
+///
+/// Called at the single moment a proposal becomes `Executed` or `Cancelled`.
+/// Every key it touches is topped up to [`TERMINAL_PROPOSAL_RETENTION`]
+/// (30 days) and, per [`bump_active_entry`], is never extended again — so after
+/// the window the entries decay to the ledger minimum and stop consuming rent.
+///
+/// The threshold is deliberately `PERSISTENT_LIFETIME_THRESHOLD`, not the
+/// retention window itself. The host only applies an extension when the entry's
+/// current TTL is at or below the threshold, so a threshold equal to the target
+/// would make this a no-op for any entry that still had a longer life left from
+/// its active bumps. A low threshold means "top up whenever this entry is
+/// anywhere near expiring", which is exactly the intent at a transition.
+fn seal_terminal_proposal(env: &Env, id: u32) {
+    for key in [
+        DataKey::Proposal(id),
+        DataKey::QuorumReachedAt(id),
+        DataKey::ProposalApprovalIdx(id),
+    ] {
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                TERMINAL_PROPOSAL_RETENTION,
+            );
+        }
+    }
+}
+
+/// `true` if the proposal exists and has reached a terminal state (#52).
+///
+/// Used by the read-only views, which hold a specific storage key rather than a
+/// loaded `Proposal` and so cannot pass a status to [`bump_active_entry`]
+/// directly. A proposal that cannot be found is reported as *not* terminal:
+/// there is no storage left to keep alive, so the distinction does not matter,
+/// and treating it as active keeps the caller's branch conservative.
+fn proposal_is_terminal(env: &Env, id: u32) -> bool {
+    env.storage()
+        .persistent()
+        .get::<DataKey, Proposal>(&DataKey::Proposal(id))
+        .is_some_and(|p| is_terminal(&p.status))
 }
 
 fn get_signer_index(env: &Env) -> Result<Map<Address, bool>, GovernanceError> {
@@ -625,37 +753,34 @@ fn save_signer_index(env: &Env, index: &Map<Address, bool>) {
     env.storage().instance().set(&DataKey::SignerIndex, index);
 }
 
-/// Extends the TTL of the per-proposal approval index so it outlives the
-/// proposal record. Called on every read and write of `ProposalApprovalIdx(id)`
-/// to prevent duplicate-approval detection from silently failing when the index
-/// archives before the proposal.
-fn bump_approval_index(env: &Env, proposal_id: u32) {
-    if env
-        .storage()
-        .persistent()
-        .has(&DataKey::ProposalApprovalIdx(proposal_id))
-    {
-        env.storage().persistent().extend_ttl(
-            &DataKey::ProposalApprovalIdx(proposal_id),
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-    }
-}
-
-fn get_approval_index(env: &Env, proposal_id: u32) -> Map<Address, bool> {
-    bump_approval_index(env, proposal_id);
+/// Read the per-proposal approval index, applying the #52 retention policy.
+///
+/// The index must outlive the proposal record it mirrors: if it decayed first,
+/// the duplicate-approval check would fall back to an empty map and a signer
+/// could approve the same proposal twice, so it is bumped together with the
+/// record rather than independently.
+fn get_approval_index(
+    env: &Env,
+    proposal_id: u32,
+    status: &ProposalStatus,
+) -> Map<Address, bool> {
+    bump_active_entry(env, &DataKey::ProposalApprovalIdx(proposal_id), status);
     env.storage()
         .persistent()
         .get(&DataKey::ProposalApprovalIdx(proposal_id))
         .unwrap_or_else(|| Map::new(env))
 }
 
-fn save_approval_index(env: &Env, proposal_id: u32, index: &Map<Address, bool>) {
+fn save_approval_index(
+    env: &Env,
+    proposal_id: u32,
+    index: &Map<Address, bool>,
+    status: &ProposalStatus,
+) {
     env.storage()
         .persistent()
         .set(&DataKey::ProposalApprovalIdx(proposal_id), index);
-    bump_approval_index(env, proposal_id);
+    bump_active_entry(env, &DataKey::ProposalApprovalIdx(proposal_id), status);
 }
 
 fn get_admin(env: &Env) -> Result<Address, GovernanceError> {
@@ -753,16 +878,24 @@ fn load_proposal(env: &Env, id: u32) -> Result<Proposal, GovernanceError> {
         .persistent()
         .get(&DataKey::Proposal(id))
         .ok_or(GovernanceError::ProposalNotFound)?;
-    bump_proposal(env, id);
-    bump_approval_index(env, id);
+    bump_proposal_retention(env, id, &proposal.status);
     Ok(proposal)
 }
 
+/// Persist a proposal and apply the #52 retention policy for its new state.
+///
+/// When the write moves a proposal into a terminal state, the one-shot archival
+/// floor is granted here as well as the skip in [`bump_proposal_retention`] —
+/// this is the moment the proposal stops needing to be kept alive, and the last
+/// moment the contract is willing to pay for its storage.
 fn save_proposal(env: &Env, id: u32, proposal: &Proposal) {
     env.storage()
         .persistent()
         .set(&DataKey::Proposal(id), proposal);
-    bump_proposal(env, id);
+    if is_terminal(&proposal.status) {
+        seal_terminal_proposal(env, id);
+    }
+    bump_proposal_retention(env, id, &proposal.status);
 }
 
 // ---------------------------------------------------------------------------
@@ -1221,7 +1354,10 @@ impl FluxoraGovernance {
         }
 
         // O(1) duplicate-approval check via per-proposal Map index.
-        let mut approval_idx = get_approval_index(&env, proposal_id);
+        // The proposal was already loaded, and the guards above reject every
+        // terminal state, so it is active here and the #52 policy keeps its
+        // storage alive for the rest of the voting window.
+        let mut approval_idx = get_approval_index(&env, proposal_id, &proposal.status);
         if approval_idx.contains_key(approver.clone()) {
             return Err(GovernanceError::AlreadyApproved);
         }
@@ -1253,8 +1389,7 @@ impl FluxoraGovernance {
         };
 
         save_proposal(&env, proposal_id, &proposal);
-        save_approval_index(&env, proposal_id, &approval_idx);
-        bump_approval_index(&env, proposal_id);
+        save_approval_index(&env, proposal_id, &approval_idx, &proposal.status);
         bump_instance(&env);
 
         env.events().publish(
@@ -1278,12 +1413,14 @@ impl FluxoraGovernance {
             env.storage()
                 .persistent()
                 .set(&DataKey::QuorumReachedAt(proposal_id), &info);
-            env.storage().persistent().extend_ttl(
+            // The proposal was just queued, so it is active: the #52 policy
+            // carries the snapshot past the timelock *and* the grace window,
+            // which is what `execute` needs from it.
+            bump_active_entry(
+                &env,
                 &DataKey::QuorumReachedAt(proposal_id),
-                PERSISTENT_LIFETIME_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
+                &proposal.status,
             );
-            bump_quorum_ttl(&env, proposal_id);
 
             env.events().publish(
                 (symbol_short!("proposal_queued"), proposal_id),
@@ -1377,7 +1514,13 @@ impl FluxoraGovernance {
             .persistent()
             .get(&DataKey::QuorumReachedAt(proposal_id))
             .ok_or(GovernanceError::QuorumNotReached)?;
-        bump_quorum_ttl(&env, proposal_id);
+        // Still `Queued` at this point, so the #52 policy keeps the snapshot
+        // alive across the dispatch below.
+        bump_active_entry(
+            &env,
+            &DataKey::QuorumReachedAt(proposal_id),
+            &proposal.status,
+        );
 
         if proposal.approval_weight < quorum_info.threshold as u64 {
             return Err(GovernanceError::QuorumNotReached);
@@ -1700,17 +1843,21 @@ impl FluxoraGovernance {
     ///   or proposal does not exist).
     ///
     /// This is a pure read — no authorization required, no state mutation
-    /// other than the standard TTL bump on the stored `QuorumInfo` entry.
+    /// other than the TTL bump applied by the #52 retention policy to the
+    /// stored `QuorumInfo` entry (skipped once the proposal is terminal).
     pub fn get_quorum_info(env: Env, proposal_id: u32) -> Option<QuorumInfo> {
         let info: Option<QuorumInfo> = env
             .storage()
             .persistent()
             .get(&DataKey::QuorumReachedAt(proposal_id));
-        if info.is_some() {
-            env.storage().persistent().extend_ttl(
+        // A view must not keep a finished proposal's storage alive, so the bump
+        // is conditional on the proposal still being active. The status lookup
+        // is a single O(1) read of a key we would not otherwise touch here.
+        if info.is_some() && !proposal_is_terminal(&env, proposal_id) {
+            bump_active_entry(
+                &env,
                 &DataKey::QuorumReachedAt(proposal_id),
-                PERSISTENT_LIFETIME_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
+                &ProposalStatus::Queued,
             );
         }
         info
@@ -1763,11 +1910,13 @@ impl FluxoraGovernance {
             .persistent()
             .get(&DataKey::QuorumReachedAt(proposal_id))
         {
+            // `Queued` is the only status that reaches this point, so the #52
+            // policy keeps the snapshot alive for this read.
             Some(info) => {
-                env.storage().persistent().extend_ttl(
+                bump_active_entry(
+                    &env,
                     &DataKey::QuorumReachedAt(proposal_id),
-                    PERSISTENT_LIFETIME_THRESHOLD,
-                    PERSISTENT_BUMP_AMOUNT,
+                    &proposal.status,
                 );
                 info
             }
@@ -1906,7 +2055,10 @@ impl FluxoraGovernance {
                 .persistent()
                 .get::<DataKey, Proposal>(&DataKey::Proposal(current))
             {
-                bump_proposal(&env, current);
+                // Paging is a bulk read, so it is exactly the kind of call that
+                // would otherwise hold every historical proposal alive forever.
+                // The #52 policy bumps only the active ones.
+                bump_active_entry(&env, &DataKey::Proposal(current), &proposal.status);
                 result.push_back(proposal);
             }
             current += 1;
@@ -4819,5 +4971,240 @@ mod tests {
         assert!(BatchTargetClient::new(&ctx.env, &target)
             .applied()
             .is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Proposal storage retention (#52)
+    // -----------------------------------------------------------------------
+
+    /// Every key a proposal owns, so a test can assert on the whole set rather
+    /// than one entry at a time.
+    fn proposal_keys(id: u32) -> [DataKey; 3] {
+        [
+            DataKey::Proposal(id),
+            DataKey::QuorumReachedAt(id),
+            DataKey::ProposalApprovalIdx(id),
+        ]
+    }
+
+    /// Current TTL, in ledgers, of a proposal's record.
+    fn proposal_ttl(env: &Env, id: u32) -> u32 {
+        use soroban_sdk::testutils::storage::Persistent as _;
+        env.storage().persistent().get_ttl(&DataKey::Proposal(id))
+    }
+
+    /// The retention windows are denominated in ledgers and must stay inside the
+    /// network's `max_entry_ttl`, or the host silently clamps them and the
+    /// policy stops meaning what it says.
+    #[test]
+    fn test_retention_windows_stay_within_network_limits() {
+        const MAX_ENTRY_TTL_LEDGERS: u32 = 6_312_000;
+        // The host rejects any `threshold > extend_to` pair outright, so every
+        // bump here pairs the low threshold with a strictly larger window.
+        assert!(TERMINAL_PROPOSAL_RETENTION > PERSISTENT_LIFETIME_THRESHOLD);
+        assert!(ACTIVE_PROPOSAL_BUMP_AMOUNT > PERSISTENT_LIFETIME_THRESHOLD);
+        // The active window must outlast the proposal's own maximum age,
+        // otherwise a queued proposal could archive while still executable.
+        assert!(ACTIVE_PROPOSAL_BUMP_AMOUNT > TERMINAL_PROPOSAL_RETENTION);
+        // Both must stay under the network cap, which clamps silently.
+        assert!(ACTIVE_PROPOSAL_BUMP_AMOUNT <= MAX_ENTRY_TTL_LEDGERS);
+        assert!(TERMINAL_PROPOSAL_RETENTION <= MAX_ENTRY_TTL_LEDGERS);
+    }
+
+    /// An active proposal is kept alive past the point where it is still useful.
+    ///
+    /// The bump is asserted directly against the recorded TTL: a proposal that
+    /// only received the old 120_960-ledger bump would archive long before the
+    /// 30-day max age, so the test pins the full retention window.
+    #[test]
+    fn test_active_proposal_storage_outlives_its_max_age() {
+        let ctx = Ctx::setup();
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("retention"));
+
+        // A freshly created proposal is `Proposed`, i.e. active, so its record
+        // must already carry the active window.
+        let ttl = proposal_ttl(&ctx.env, id);
+        assert!(
+            ttl >= ACTIVE_PROPOSAL_BUMP_AMOUNT - 1,
+            "active proposal TTL {ttl} below the active window {ACTIVE_PROPOSAL_BUMP_AMOUNT}"
+        );
+        // And that window must outlast the proposal's own maximum age, which is
+        // the whole point: an unfinished proposal is never worth reading after
+        // `created_at + MAX_PROPOSAL_AGE_SECONDS`.
+        assert!(
+            ttl as u64 > MAX_AGE / SECONDS_PER_LEDGER,
+            "active TTL would expire before the proposal could still be acted on"
+        );
+    }
+
+    /// Voting keeps an active proposal alive — this is the "apply TTL extension
+    /// during voting and queuing" half of the policy.
+    #[test]
+    fn test_voting_and_queuing_extend_the_active_window() {
+        use soroban_sdk::testutils::storage::Persistent as _;
+        let ctx = Ctx::setup();
+        let id = queued(&ctx, &ctx.dummy_target(), &ctx.calldata("vote"));
+
+        for key in proposal_keys(id) {
+            assert!(
+                ctx.env.storage().persistent().has(&key),
+                "queued proposal should own {key:?}"
+            );
+            let ttl = ctx.env.storage().persistent().get_ttl(&key);
+            assert!(
+                ttl >= ACTIVE_PROPOSAL_BUMP_AMOUNT - 1,
+                "{key:?} TTL {ttl} not carried to the active window"
+            );
+        }
+        // Queued is still active, so the record must not have been sealed.
+        assert_eq!(
+            ctx.client.get_proposal_status(&id),
+            ProposalStatus::Queued
+        );
+    }
+
+    /// Executing a proposal grants the terminal floor and then stops paying:
+    /// later reads must not top the entry back up.
+    ///
+    /// This is the decay guarantee. Without it, every `get_proposal` on a
+    /// historical proposal would extend its rent forever and governance storage
+    /// would grow without bound.
+    #[test]
+    fn test_executed_proposal_decays_instead_of_being_kept_alive() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let id = queued(&ctx, &target, &set_cap(&ctx.env, 5));
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        ctx.client.execute(&Address::generate(&ctx.env), &id);
+
+        assert_eq!(
+            ctx.client.get_proposal_status(&id),
+            ProposalStatus::Executed
+        );
+
+        // The seal guarantees *at least* the 30-day floor. It cannot lower an
+        // entry that still had a longer life left over from its active bumps,
+        // because `extend_ttl` only ever raises a TTL.
+        let sealed = proposal_ttl(&ctx.env, id);
+        assert!(
+            sealed >= TERMINAL_PROPOSAL_RETENTION,
+            "execution left only {sealed} ledgers, below the {TERMINAL_PROPOSAL_RETENTION} floor"
+        );
+
+        // Advance the ledger so any read-triggered bump would be visible, then
+        // read the proposal repeatedly. Each read is a fresh host invocation, so
+        // a retained entry would climb back to the active window.
+        ctx.env.ledger().set_sequence_number(50_000);
+        for _ in 0..5 {
+            let _ = ctx.client.get_proposal(&id);
+        }
+        let after_reads = proposal_ttl(&ctx.env, id);
+
+        // Reads must not extend a terminal proposal, so the only movement is
+        // decay with the ledger.
+        assert!(
+            after_reads < sealed,
+            "reads revived a terminal proposal: {after_reads} >= {sealed}"
+        );
+        assert_eq!(
+            after_reads,
+            sealed - 50_000,
+            "terminal TTL should only fall with the ledger"
+        );
+    }
+
+    /// The same decay guarantee holds for a cancelled proposal.
+    #[test]
+    fn test_cancelled_proposal_decays_instead_of_being_kept_alive() {
+        let ctx = Ctx::setup();
+        let id = ctx.client.propose(
+            &ctx.signer_a,
+            &ctx.dummy_target(),
+            &ctx.calldata("cancel"),
+        );
+        ctx.client.cancel_proposal(&ctx.signer_a, &id);
+
+        assert_eq!(
+            ctx.client.get_proposal_status(&id),
+            ProposalStatus::Cancelled
+        );
+        let sealed = proposal_ttl(&ctx.env, id);
+        assert!(sealed >= TERMINAL_PROPOSAL_RETENTION);
+
+        ctx.env.ledger().set_sequence_number(50_000);
+        for _ in 0..5 {
+            let _ = ctx.client.get_proposal(&id);
+        }
+        assert!(proposal_ttl(&ctx.env, id) < sealed);
+    }
+
+    /// Bulk reads must not resurrect dead proposals. Paging over history is the
+    /// single most likely way an unbounded retention policy would creep back in,
+    /// because it touches every proposal at once.
+    #[test]
+    fn test_paging_history_does_not_revive_terminal_proposals() {
+        let ctx = Ctx::setup();
+        let done =
+            ctx.client
+                .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("done"));
+        ctx.client.cancel_proposal(&ctx.signer_a, &done);
+        let live =
+            ctx.client
+                .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("live"));
+
+        let sealed = proposal_ttl(&ctx.env, done);
+        ctx.env.ledger().set_sequence_number(50_000);
+
+        let page = ctx.client.get_proposals_by_id_range(&0, &10);
+        assert_eq!(page.len(), 2);
+
+        // The cancelled proposal only decays across the elapsed ledgers: the
+        // page bumped the live one and left this one alone.
+        assert_eq!(
+            proposal_ttl(&ctx.env, done),
+            sealed - 50_000,
+            "paging extended a terminal proposal"
+        );
+        // The live one is still carried to the active window by the same call.
+        assert!(proposal_ttl(&ctx.env, live) >= ACTIVE_PROPOSAL_BUMP_AMOUNT - 50_000);
+    }
+
+    /// `get_quorum_info` is a public view, so it must respect the same rule:
+    /// readable for a terminal proposal, but not a way to keep one alive.
+    #[test]
+    fn test_quorum_view_does_not_revive_an_executed_proposal() {
+        use soroban_sdk::testutils::storage::Persistent as _;
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let id = queued(&ctx, &target, &set_cap(&ctx.env, 5));
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        ctx.client.execute(&Address::generate(&ctx.env), &id);
+
+        use soroban_sdk::testutils::storage::Persistent as _;
+        let sealed = ctx
+            .env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::QuorumReachedAt(id));
+        assert!(sealed >= TERMINAL_PROPOSAL_RETENTION);
+
+        ctx.env.ledger().set_sequence_number(50_000);
+        // The snapshot is still readable — that is the point of the floor.
+        assert!(ctx.client.get_quorum_info(&id).is_some());
+
+        // Reading it must not have extended anything: the snapshot's TTL still
+        // equals whatever the terminal seal left, minus the elapsed ledgers.
+        let ttl = ctx
+            .env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::QuorumReachedAt(id));
+        assert_eq!(
+            ttl,
+            sealed - 50_000,
+            "the quorum view extended an executed proposal's snapshot"
+        );
     }
 }
