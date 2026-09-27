@@ -4330,7 +4330,10 @@ mod tests {
     fn test_static_audit_execute_applies_cei_before_dispatch() {
         let body = entrypoint_source("execute");
         let dispatch = body.find("dispatch_call(").expect("execute dispatches");
-        for effect in ["proposal.status = ProposalStatus::Executed", "Executing, &true"] {
+        for effect in [
+            "proposal.status = ProposalStatus::Executed",
+            "Executing, &true",
+        ] {
             let at = body
                 .find(effect)
                 .unwrap_or_else(|| panic!("execute no longer performs `{effect}`"));
@@ -4644,7 +4647,8 @@ mod tests {
 
         // Nor can it widen its own powers into a shortcut: being an emergency
         // guardian buys cancellation, never early execution.
-        ctx.client.set_emergency_guardians(&vec![&ctx.env, ctx.admin.clone()]);
+        ctx.client
+            .set_emergency_guardians(&vec![&ctx.env, ctx.admin.clone()]);
 
         // With every auth mocked, the admin still cannot skip the timelock.
         let id = queued_set_cap_proposal(&ctx, &target, 42);
@@ -4677,8 +4681,7 @@ mod tests {
         let contract_id = env.register_contract(None, FluxoraGovernance);
         let admin = Address::generate(&env);
         let signer = Address::generate(&env);
-        FluxoraGovernanceClient::new(&env, &contract_id)
-            .init(&admin, &vec![&env, signer], &1u32);
+        FluxoraGovernanceClient::new(&env, &contract_id).init(&admin, &vec![&env, signer], &1u32);
 
         // The mock is governed by the governance contract. `init` needs no
         // authorization; only the setter does.
