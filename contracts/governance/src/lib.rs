@@ -20,6 +20,17 @@ const MAX_SIGNERS: u32 = 20;
 /// Maximum byte length for proposal calldata payload.
 const MAX_CALLDATA_BYTES: u32 = 4_096;
 
+/// Maximum number of operations in a single batch proposal (#51).
+///
+/// A batch is executed as a sequence of cross-contract invocations inside one
+/// transaction, so its cost is linear in this number. Five covers the policy
+/// updates that motivated batching (for example duration bounds *and*
+/// allowlist) with room to spare, while keeping the worst case well inside a
+/// transaction's instruction and rent budget. See
+/// `docs/governance-batch-proposals.md` for the bounds this was checked
+/// against, and for what is and is not measured.
+const MAX_BATCH_CALLS: u32 = 5;
+
 /// Maximum age in seconds for a proposal before it expires and becomes
 /// non-executable. Default: 30 days.
 const MAX_PROPOSAL_AGE_SECONDS: u64 = 2_592_000;
@@ -167,6 +178,12 @@ pub enum GovernanceError {
     /// The old code was unreachable: decoding `21` always resolved to
     /// `TimelockNotMet`.
     InvalidProposalState = 26,
+    /// A batch payload holds more than [`MAX_BATCH_CALLS`] operations.
+    ///
+    /// Bounds the worst-case instruction and rent cost of a single execution
+    /// (#51). The limit is structural, not a policy knob: no valid batch
+    /// exceeds it, so a proposal that trips it can never be executed.
+    BatchTooLarge = 27,
 }
 
 /// Storage keys for the governance contract.
@@ -213,20 +230,45 @@ pub enum DataKey {
 // Typed calldata adapter
 // ---------------------------------------------------------------------------
 
+/// One entry of a batch proposal: a target contract plus the XDR-encoded
+/// [`CallData`] describing what to do to it.
+///
+/// A batch is a list of these, so a single proposal can update several
+/// parameters — on one target or across several — inside one timelock cycle.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ExecutionCall {
+    /// Contract to invoke.
+    pub target: Address,
+    /// XDR-encoded single-operation [`CallData`]. Batches may not nest.
+    pub calldata: Bytes,
+}
+
 /// Typed encoding of every parameter change that governance is authorised to
 /// perform on-chain.  Proposers serialise one of these variants to XDR bytes
 /// via `.to_xdr(&env)` and pass the result as the `calldata` field of
 /// `propose`.  `execute` decodes the bytes with `CallData::from_xdr` and
 /// dispatches to the target contract.
 ///
+/// The wire form of a variant is its *name* (a `Symbol`), not its position, so
+/// adding a variant — [`Batch`](CallData::Batch) included — leaves every
+/// already-encoded proposal decodable.
+///
 /// Adding a new governed operation = adding a new variant here and a matching
-/// arm in `dispatch_call`.
+/// arm in `dispatch_operation`.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub enum CallData {
     // ---- no-op (for testing governance mechanics without a live target) ----
     /// No operation — dispatch performs no cross-contract call.
     Noop,
+
+    // ---- batch of operations (issue #51) ----
+    /// `Vec<ExecutionCall>` applied in order, all-or-nothing.
+    ///
+    /// Each entry's `calldata` must itself decode to a single-operation
+    /// variant; a nested `Batch` is rejected. Bounded by `MAX_BATCH_CALLS`.
+    Batch(Vec<ExecutionCall>),
 
     // ---- stream contract operations ----
     /// `set_admin(new_admin)`
@@ -257,12 +299,57 @@ pub enum CallData {
     FactorySetStreamWasmHash(BytesN<32>),
 }
 
+/// Decode `calldata` bytes into a `CallData` variant.
+fn decode_calldata(env: &Env, calldata: &Bytes) -> Result<CallData, GovernanceError> {
+    CallData::from_xdr(env, calldata).map_err(|_| GovernanceError::InvalidCalldata)
+}
+
 /// Decode `calldata` bytes into a `CallData` variant and invoke the target.
 /// Called inside `execute` *after* the proposal has been marked executed (CEI).
+///
+/// A [`CallData::Batch`] payload is applied in order, each entry carrying its
+/// own target. Atomicity is the host's: every write performed here — including
+/// the writes made by the earlier entries of a batch — is part of the
+/// transaction, so an error from any entry, or a trap in any target, unwinds
+/// all of them. A partially applied batch is not reachable.
 fn dispatch_call(env: &Env, target: &Address, calldata: &Bytes) -> Result<(), GovernanceError> {
-    let op = CallData::from_xdr(env, calldata).map_err(|_| GovernanceError::InvalidCalldata)?;
+    match decode_calldata(env, calldata)? {
+        CallData::Batch(calls) => {
+            if calls.is_empty() {
+                return Err(GovernanceError::InvalidCalldata);
+            }
+            if calls.len() > MAX_BATCH_CALLS {
+                return Err(GovernanceError::BatchTooLarge);
+            }
+            for call in calls.iter() {
+                let inner = decode_calldata(env, &call.calldata)?;
+                if matches!(inner, CallData::Batch(_)) {
+                    // Batches do not nest: nesting would let a proposal
+                    // exceed MAX_BATCH_CALLS by hiding calls one level down.
+                    return Err(GovernanceError::InvalidCalldata);
+                }
+                dispatch_operation(env, &call.target, inner)?;
+            }
+            Ok(())
+        }
+        // A single-operation proposal: dispatch to the proposal's own target.
+        op => dispatch_operation(env, target, op),
+    }
+}
+
+/// Invoke `target` for a single decoded operation. `op` is never
+/// [`CallData::Batch`]; `dispatch_call` handles that variant itself.
+///
+/// Takes `op` by value so each arm binds the same owned values the
+/// non-batch dispatch path has always passed to `invoke_contract`.
+fn dispatch_operation(env: &Env, target: &Address, op: CallData) -> Result<(), GovernanceError> {
     match op {
         CallData::Noop => {}
+        CallData::Batch(_) => {
+            // Unreachable: `dispatch_call` peels the batch off before calling
+            // here, and inner entries are rejected if they are batches.
+            return Err(GovernanceError::InvalidCalldata);
+        }
         CallData::StreamSetAdmin(new_admin) => {
             env.invoke_contract::<()>(
                 target,
@@ -1020,7 +1107,12 @@ impl FluxoraGovernance {
     /// # Parameters
     /// - `proposer`: The co-signer submitting the proposal.
     /// - `target`: The contract address to call when the proposal is executed.
-    /// - `calldata`: Opaque bytes encoding the intended operation (stored for audit).
+    ///   Ignored when `calldata` is a [`CallData::Batch`], where every entry
+    ///   carries its own target; it is still stored for the audit trail.
+    /// - `calldata`: Opaque bytes encoding the intended operation (stored for
+    ///   audit). Either a single-operation [`CallData`] variant or a
+    ///   [`CallData::Batch`] of up to [`MAX_BATCH_CALLS`] operations applied in
+    ///   order, all-or-nothing (#51).
     ///
     /// # Returns
     /// - The proposal ID assigned to the new proposal (monotonically increasing u32).
@@ -4138,5 +4230,594 @@ mod tests {
             "the guard must prevent a second proposal from being pushed through reentrancy"
         );
         assert_eq!(executed_event_count(&ctx.env, &ctx.contract_id), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch proposals (issue #51)
+    //
+    // A `CallData::Batch` payload carries up to MAX_BATCH_CALLS
+    // `ExecutionCall`s, each with its own target, and `execute` applies them in
+    // order. The property that matters is all-or-nothing: if any entry fails,
+    // the host unwinds the whole transaction, so the entries that already ran
+    // leave no trace and the proposal stays executable.
+    //
+    // The mocks below make that observable. `BatchTarget` records the order in
+    // which governance applied its setters, `FlakyTarget` can be told to start
+    // failing to model a transient downstream lock, and both require the
+    // governance contract's authorization, so no state changes except through
+    // `execute`.
+    //
+    // The write-up is docs/governance-batch-proposals.md.
+    // -----------------------------------------------------------------------
+
+    /// Storage keys for [`BatchTarget`].
+    #[contracttype]
+    #[derive(Clone, Debug)]
+    pub enum BatchTargetKey {
+        /// The only address permitted to mutate this mock.
+        Controller,
+        /// Deposit cap, written by `set_cap`.
+        Cap,
+        /// Minimum duration, written by `set_min_duration`.
+        MinDuration,
+        /// Allowlist flag, written by `set_allowlist`.
+        Allowed,
+        /// Order in which the governed setters were applied.
+        Applied,
+    }
+
+    /// Op codes recorded in [`BatchTargetKey::Applied`].
+    const OP_SET_CAP: u32 = 1;
+    const OP_SET_MIN_DURATION: u32 = 2;
+    const OP_SET_ALLOWLIST: u32 = 3;
+
+    /// Governed stand-in whose three setters are reachable through
+    /// `FactorySetCap`, `FactorySetMinDuration` and `FactorySetAllowlist`.
+    #[contract]
+    pub struct BatchTarget;
+
+    #[contractimpl]
+    impl BatchTarget {
+        pub fn init(env: Env, controller: Address) {
+            env.storage()
+                .instance()
+                .set(&BatchTargetKey::Controller, &controller);
+            env.storage().instance().set(&BatchTargetKey::Cap, &0i128);
+            env.storage()
+                .instance()
+                .set(&BatchTargetKey::MinDuration, &0u64);
+            env.storage()
+                .instance()
+                .set(&BatchTargetKey::Allowed, &false);
+            env.storage()
+                .instance()
+                .set(&BatchTargetKey::Applied, &Vec::new(&env));
+        }
+
+        pub fn set_cap(env: Env, cap: i128) {
+            controller_of(&env, &BatchTargetKey::Controller).require_auth();
+            env.storage().instance().set(&BatchTargetKey::Cap, &cap);
+            record_applied(&env, OP_SET_CAP);
+        }
+
+        pub fn set_min_duration(env: Env, min_duration: u64) {
+            controller_of(&env, &BatchTargetKey::Controller).require_auth();
+            env.storage()
+                .instance()
+                .set(&BatchTargetKey::MinDuration, &min_duration);
+            record_applied(&env, OP_SET_MIN_DURATION);
+        }
+
+        pub fn set_allowlist(env: Env, _recipient: Address, allowed: bool) {
+            controller_of(&env, &BatchTargetKey::Controller).require_auth();
+            env.storage()
+                .instance()
+                .set(&BatchTargetKey::Allowed, &allowed);
+            record_applied(&env, OP_SET_ALLOWLIST);
+        }
+
+        /// The ordered log of setters governance has applied.
+        pub fn applied(env: Env) -> Vec<u32> {
+            env.storage()
+                .instance()
+                .get(&BatchTargetKey::Applied)
+                .unwrap_or_else(|| Vec::new(&env))
+        }
+
+        pub fn cap(env: Env) -> i128 {
+            env.storage()
+                .instance()
+                .get(&BatchTargetKey::Cap)
+                .unwrap_or(0)
+        }
+
+        pub fn min_duration(env: Env) -> u64 {
+            env.storage()
+                .instance()
+                .get(&BatchTargetKey::MinDuration)
+                .unwrap_or(0)
+        }
+
+        pub fn allowed(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&BatchTargetKey::Allowed)
+                .unwrap_or(false)
+        }
+    }
+
+    /// Read the controller recorded under `key` for one of the batch mocks.
+    fn controller_of(env: &Env, key: &BatchTargetKey) -> Address {
+        env.storage()
+            .instance()
+            .get(key)
+            .expect("controller set by init")
+    }
+
+    /// Append an op code to the mock's ordered log.
+    fn record_applied(env: &Env, op: u32) {
+        let mut log: Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&BatchTargetKey::Applied)
+            .expect("log initialised by init");
+        log.push_back(op);
+        env.storage().instance().set(&BatchTargetKey::Applied, &log);
+    }
+
+    /// Storage keys for [`FlakyTarget`].
+    #[contracttype]
+    #[derive(Clone, Debug)]
+    pub enum FlakyTargetKey {
+        /// The only address permitted to mutate this mock.
+        Controller,
+        /// When true, `set_cap` traps instead of applying.
+        Failing,
+        /// Value written by `set_cap` when the target is healthy.
+        Cap,
+    }
+
+    /// Governed stand-in that can be switched into a failing state, to model a
+    /// transient downstream lock during `execute` (#51 atomicity, #53 recovery).
+    #[contract]
+    pub struct FlakyTarget;
+
+    #[contractimpl]
+    impl FlakyTarget {
+        pub fn init(env: Env, controller: Address) {
+            env.storage()
+                .instance()
+                .set(&FlakyTargetKey::Controller, &controller);
+            env.storage()
+                .instance()
+                .set(&FlakyTargetKey::Failing, &false);
+            env.storage().instance().set(&FlakyTargetKey::Cap, &0i128);
+        }
+
+        /// Toggle the simulated downstream failure. Callable by anyone: it is
+        /// the test fixture's own switch, not governed state.
+        pub fn set_failing(env: Env, failing: bool) {
+            env.storage()
+                .instance()
+                .set(&FlakyTargetKey::Failing, &failing);
+        }
+
+        pub fn is_failing(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&FlakyTargetKey::Failing)
+                .unwrap_or(false)
+        }
+
+        /// Traps while the target is failing, so governance's dispatch panics
+        /// and the host unwinds the entire transaction.
+        pub fn set_cap(env: Env, cap: i128) {
+            let controller: Address = env
+                .storage()
+                .instance()
+                .get(&FlakyTargetKey::Controller)
+                .expect("controller set by init");
+            controller.require_auth();
+            if env
+                .storage()
+                .instance()
+                .get(&FlakyTargetKey::Failing)
+                .unwrap_or(false)
+            {
+                panic!("downstream state locked");
+            }
+            env.storage().instance().set(&FlakyTargetKey::Cap, &cap);
+        }
+
+        pub fn cap(env: Env) -> i128 {
+            env.storage()
+                .instance()
+                .get(&FlakyTargetKey::Cap)
+                .unwrap_or(0)
+        }
+    }
+
+    /// XDR-encode any `CallData` payload.
+    fn op_calldata(env: &Env, op: CallData) -> Bytes {
+        use soroban_sdk::xdr::ToXdr;
+        op.to_xdr(env)
+    }
+
+    /// XDR-encode a batch payload of `calls`, in order.
+    ///
+    /// Takes the `Vec` by value: it becomes the `CallData::Batch` payload
+    /// verbatim, so the test module hands over exactly the entries it built
+    /// with the `vec!` macro.
+    fn batch_calldata(env: &Env, calls: Vec<ExecutionCall>) -> Bytes {
+        op_calldata(env, CallData::Batch(calls))
+    }
+
+    /// `count` entries that each apply `FactorySetCap(3)` to `target`.
+    fn cap_entries(env: &Env, target: &Address, count: u32) -> Vec<ExecutionCall> {
+        let mut entries = Vec::new(env);
+        for _ in 0..count {
+            entries.push_back(ExecutionCall {
+                target: target.clone(),
+                calldata: set_cap(env, 3),
+            });
+        }
+        entries
+    }
+
+    /// One entry of a batch: `op` applied to `target`.
+    fn entry(env: &Env, target: &Address, op: CallData) -> ExecutionCall {
+        ExecutionCall {
+            target: target.clone(),
+            calldata: op_calldata(env, op),
+        }
+    }
+
+    /// One entry of a batch with an arbitrary payload — used to build entries
+    /// that must be refused (nested batch, undecodable bytes).
+    fn entry_raw(target: &Address, calldata: Bytes) -> ExecutionCall {
+        ExecutionCall {
+            target: target.clone(),
+            calldata,
+        }
+    }
+
+    /// XDR-encode `FactorySetCap(cap)`.
+    fn set_cap(env: &Env, cap: i128) -> Bytes {
+        op_calldata(env, CallData::FactorySetCap(cap))
+    }
+
+    fn deploy_batch_target(ctx: &Ctx) -> Address {
+        let target = ctx.env.register(BatchTarget, ());
+        BatchTargetClient::new(&ctx.env, &target).init(&ctx.contract_id);
+        target
+    }
+
+    fn deploy_flaky_target(ctx: &Ctx) -> Address {
+        let target = ctx.env.register(FlakyTarget, ());
+        FlakyTargetClient::new(&ctx.env, &target).init(&ctx.contract_id);
+        target
+    }
+
+    /// Queue a proposal for `calldata` and advance past the timelock.
+    fn queued(ctx: &Ctx, target: &Address, calldata: &Bytes) -> u32 {
+        let id = ctx.client.propose(&ctx.signer_a, target, calldata);
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id);
+        id
+    }
+
+    /// The control case: a single operation still dispatches unchanged.
+    #[test]
+    fn test_single_call_proposal_still_dispatches() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let client = BatchTargetClient::new(&ctx.env, &target);
+        let id = queued(&ctx, &target, &set_cap(&ctx.env, 42));
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        ctx.client.execute(&Address::generate(&ctx.env), &id);
+
+        assert_eq!(client.cap(), 42);
+        assert_eq!(client.applied(), vec![&ctx.env, OP_SET_CAP]);
+    }
+
+    /// Every entry of a batch is applied, in the order it was written.
+    #[test]
+    fn test_batch_applies_every_call_in_order() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let client = BatchTargetClient::new(&ctx.env, &target);
+        let recipient = Address::generate(&ctx.env);
+        let calls = vec![
+            entry(&ctx.env, &target, CallData::FactorySetCap(500)),
+            entry(
+                &ctx.env,
+                &target,
+                CallData::FactorySetMinDuration(1_209_600),
+            ),
+            entry(
+                &ctx.env,
+                &target,
+                CallData::FactorySetAllowlist(recipient, true),
+            ),
+            // A `Noop` entry is a legal no-op and must not disturb the others.
+            entry(&ctx.env, &target, CallData::Noop),
+        ];
+        let calldata = batch_calldata(&ctx.env, calls);
+        let id = queued(&ctx, &target, &calldata);
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        ctx.client.execute(&Address::generate(&ctx.env), &id);
+
+        assert_eq!(client.cap(), 500);
+        assert_eq!(client.min_duration(), 1_209_600);
+        assert!(client.allowed());
+        assert_eq!(
+            client.applied(),
+            vec![&ctx.env, OP_SET_CAP, OP_SET_MIN_DURATION, OP_SET_ALLOWLIST]
+        );
+        assert!(ctx.client.get_proposal(&id).executed);
+    }
+
+    /// One proposal, two targets: each entry carries its own address, so a
+    /// policy update that spans contracts needs a single timelock cycle.
+    #[test]
+    fn test_batch_spans_multiple_targets() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let flaky = deploy_flaky_target(&ctx);
+        let target_client = BatchTargetClient::new(&ctx.env, &target);
+        let flaky_client = FlakyTargetClient::new(&ctx.env, &flaky);
+
+        let calls = vec![
+            entry(&ctx.env, &target, CallData::FactorySetCap(7)),
+            entry(&ctx.env, &flaky, CallData::FactorySetCap(9)),
+        ];
+        let calldata = batch_calldata(&ctx.env, calls);
+        let id = queued(&ctx, &target, &calldata);
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        ctx.client.execute(&Address::generate(&ctx.env), &id);
+
+        assert_eq!(target_client.cap(), 7);
+        assert_eq!(flaky_client.cap(), 9);
+        assert!(ctx.client.get_proposal(&id).executed);
+    }
+
+    /// The atomicity property: a failing entry unwinds the entries before it.
+    ///
+    /// `set_cap` on the healthy target runs first and succeeds; the second
+    /// entry traps. After the failed execution the healthy target must still
+    /// read zero, the proposal must not be marked executed, no
+    /// `proposal_executed` event may exist, and the proposal must still be
+    /// executable.
+    #[test]
+    fn test_batch_reverts_every_call_when_one_fails() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let flaky = deploy_flaky_target(&ctx);
+        let target_client = BatchTargetClient::new(&ctx.env, &target);
+        let flaky_client = FlakyTargetClient::new(&ctx.env, &flaky);
+        flaky_client.set_failing(&true);
+
+        let calls = vec![
+            entry(&ctx.env, &target, CallData::FactorySetCap(7)),
+            entry(&ctx.env, &flaky, CallData::FactorySetCap(9)),
+        ];
+        let calldata = batch_calldata(&ctx.env, calls);
+        let id = queued(&ctx, &target, &calldata);
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        let executor = Address::generate(&ctx.env);
+        assert!(
+            ctx.client.try_execute(&executor, &id).is_err(),
+            "a trapping sub-call must fail the whole execution"
+        );
+
+        // The first entry's write is gone, not merely the second's.
+        assert_eq!(target_client.cap(), 0);
+        assert!(target_client.applied().is_empty());
+        assert_eq!(flaky_client.cap(), 0);
+        assert!(!ctx.client.get_proposal(&id).executed);
+        assert_eq!(executed_event_count(&ctx.env, &ctx.contract_id), 0);
+        // Still executable: a transient failure is retryable (#53).
+        assert!(ctx.client.is_executable(&id));
+    }
+
+    /// A transient failure is retryable: once the downstream lock clears, the
+    /// same proposal executes and every entry lands exactly once.
+    #[test]
+    fn test_batch_is_retryable_after_a_transient_failure() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let flaky = deploy_flaky_target(&ctx);
+        let target_client = BatchTargetClient::new(&ctx.env, &target);
+        let flaky_client = FlakyTargetClient::new(&ctx.env, &flaky);
+
+        let calls = vec![
+            entry(&ctx.env, &target, CallData::FactorySetCap(7)),
+            entry(&ctx.env, &flaky, CallData::FactorySetCap(9)),
+        ];
+        let calldata = batch_calldata(&ctx.env, calls);
+        let id = queued(&ctx, &target, &calldata);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        let executor = Address::generate(&ctx.env);
+
+        flaky_client.set_failing(&true);
+        assert!(ctx.client.try_execute(&executor, &id).is_err());
+        assert_eq!(target_client.cap(), 0);
+
+        flaky_client.set_failing(&false);
+        ctx.client.execute(&executor, &id);
+
+        assert_eq!(target_client.cap(), 7);
+        assert_eq!(flaky_client.cap(), 9);
+        assert_eq!(target_client.applied(), vec![&ctx.env, OP_SET_CAP]);
+        assert!(ctx.client.get_proposal(&id).executed);
+        assert_eq!(executed_event_count(&ctx.env, &ctx.contract_id), 1);
+
+        // A second execution cannot replay the batch.
+        assert_eq!(
+            ctx.client.try_execute(&executor, &id),
+            Err(Ok(GovernanceError::AlreadyExecuted))
+        );
+        assert_eq!(target_client.applied(), vec![&ctx.env, OP_SET_CAP]);
+    }
+
+    /// Batching does not weaken the timelock: the whole batch waits for the eta.
+    #[test]
+    fn test_batch_still_respects_the_timelock() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let client = BatchTargetClient::new(&ctx.env, &target);
+        let calls = vec![
+            entry(&ctx.env, &target, CallData::FactorySetCap(7)),
+            entry(
+                &ctx.env,
+                &target,
+                CallData::FactorySetMinDuration(1_209_600),
+            ),
+        ];
+        let calldata = batch_calldata(&ctx.env, calls);
+        let id = queued(&ctx, &target, &calldata);
+
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &id),
+            Err(Ok(GovernanceError::TimelockNotMet))
+        );
+        assert_eq!(client.cap(), 0);
+        assert!(client.applied().is_empty());
+    }
+
+    #[test]
+    fn test_empty_batch_is_rejected() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let calldata = batch_calldata(&ctx.env, Vec::new(&ctx.env));
+        let id = queued(&ctx, &target, &calldata);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &id),
+            Err(Ok(GovernanceError::InvalidCalldata))
+        );
+        assert!(BatchTargetClient::new(&ctx.env, &target)
+            .applied()
+            .is_empty());
+    }
+
+    /// The bound is inclusive: exactly `MAX_BATCH_CALLS` entries execute, and
+    /// one more is refused before any target is reached.
+    #[test]
+    fn test_batch_is_bounded_by_max_batch_calls() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let client = BatchTargetClient::new(&ctx.env, &target);
+        let executor = Address::generate(&ctx.env);
+
+        let too_big = batch_calldata(
+            &ctx.env,
+            cap_entries(&ctx.env, &target, MAX_BATCH_CALLS + 1),
+        );
+        let big_id = queued(&ctx, &target, &too_big);
+        let at_limit = batch_calldata(&ctx.env, cap_entries(&ctx.env, &target, MAX_BATCH_CALLS));
+        let ok_id = queued(&ctx, &target, &at_limit);
+
+        // Both proposals are queued at the same instant, so one clock advance
+        // past the timelock makes them executable.
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+
+        assert_eq!(
+            ctx.client.try_execute(&executor, &big_id),
+            Err(Ok(GovernanceError::BatchTooLarge))
+        );
+        assert!(
+            client.applied().is_empty(),
+            "an over-limit batch must be refused before the first target call"
+        );
+
+        ctx.client.execute(&executor, &ok_id);
+
+        assert_eq!(client.cap(), 3);
+        assert_eq!(client.applied().len(), MAX_BATCH_CALLS);
+        assert!(ctx.client.get_proposal(&ok_id).executed);
+    }
+
+    /// The cost envelope, measured where it can be measured without a network:
+    /// a worst-case batch payload stays inside `MAX_CALLDATA_BYTES`, so the
+    /// entry bound can never be widened by relaxing the calldata limit.
+    #[test]
+    fn test_max_batch_payload_fits_within_max_calldata_bytes() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        // Largest inner payload governance can dispatch: a 32-byte wasm hash.
+        let worst = entry(
+            &ctx.env,
+            &target,
+            CallData::FactorySetStreamWasmHash(BytesN::from_array(&ctx.env, &[0x11; 32])),
+        );
+        let entries = vec![
+            &ctx.env,
+            worst.clone(),
+            worst.clone(),
+            worst.clone(),
+            worst.clone(),
+            worst,
+        ];
+        let payload = batch_calldata(&ctx.env, entries);
+
+        assert!(
+            payload.len() <= MAX_CALLDATA_BYTES,
+            "a {}-call batch of the largest operation encodes to {} bytes, over the {}-byte limit",
+            MAX_BATCH_CALLS,
+            payload.len(),
+            MAX_CALLDATA_BYTES
+        );
+    }
+
+    /// Batches do not nest, so `MAX_BATCH_CALLS` cannot be side-stepped by
+    /// hiding calls one level down.
+    #[test]
+    fn test_nested_batch_is_rejected() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let inner = batch_calldata(&ctx.env, cap_entries(&ctx.env, &target, 1));
+        let calldata = batch_calldata(&ctx.env, vec![&ctx.env, entry_raw(&target, inner)]);
+        let id = queued(&ctx, &target, &calldata);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &id),
+            Err(Ok(GovernanceError::InvalidCalldata))
+        );
+        assert_eq!(BatchTargetClient::new(&ctx.env, &target).cap(), 0);
+    }
+
+    /// An entry whose payload is not a decodable `CallData` fails the batch
+    /// before any target is reached.
+    #[test]
+    fn test_batch_entry_with_undecodable_calldata_is_rejected() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let junk = Bytes::from_slice(&ctx.env, &[0xff, 0x00, 0x01]);
+        let calldata = batch_calldata(
+            &ctx.env,
+            vec![
+                &ctx.env,
+                entry(&ctx.env, &target, CallData::FactorySetCap(7)),
+                entry_raw(&target, junk),
+            ],
+        );
+        let id = queued(&ctx, &target, &calldata);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &id),
+            Err(Ok(GovernanceError::InvalidCalldata))
+        );
+        assert_eq!(BatchTargetClient::new(&ctx.env, &target).cap(), 0);
+        assert!(BatchTargetClient::new(&ctx.env, &target)
+            .applied()
+            .is_empty());
     }
 }
