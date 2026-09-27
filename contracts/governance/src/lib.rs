@@ -92,6 +92,10 @@ pub struct Proposal {
     pub approval_weight: u64,
     /// Ledger timestamp at which the proposal was submitted.
     pub created_at: u64,
+    /// Earliest ledger timestamp at which this proposal may execute; zero until quorum.
+    pub eta: u64,
+    /// Signer configuration generation captured when the proposal was created.
+    pub signer_generation: u64,
     /// Authoritative lifecycle state.
     pub status: ProposalStatus,
     /// True once `execute` has been called successfully.
@@ -148,8 +152,21 @@ pub enum GovernanceError {
     CalldataEmpty = 19,
     /// Proposal calldata failed to decode into a known `CallData` variant.
     InvalidCalldata = 20,
+    /// A proposal predates the current signer-configuration generation and must
+    /// be re-proposed under the signer set currently in force.
+    InvalidSignerGeneration = 22,
+    /// A dispatch is already in flight; re-entering `execute` is rejected.
+    ReentrancyGuard = 23,
+    /// The emergency-guardian list exceeds `MAX_SIGNERS`.
+    TooManyEmergencyGuardians = 24,
+    /// An address is already registered as an emergency guardian.
+    DuplicateEmergencyGuardian = 25,
     /// The requested operation is not legal for the proposal's current state.
-    InvalidProposalState = 21,
+    ///
+    /// Renumbered from `21`, where it collided with [`Self::TimelockNotMet`].
+    /// The old code was unreachable: decoding `21` always resolved to
+    /// `TimelockNotMet`.
+    InvalidProposalState = 26,
 }
 
 /// Storage keys for the governance contract.
@@ -161,9 +178,22 @@ pub enum DataKey {
     /// Registered co-signers list (instance storage).
     Signers = 1,
     /// Minimum approval threshold (instance storage).
-    Threshold,
+    Threshold = 2,
+    /// Seconds a proposal may remain executable after its `eta` (instance storage).
+    GracePeriod = 9,
+    /// Emergency guardian addresses authorized to cancel proposals.
+    EmergencyGuardians = 10,
+    /// Assigned voting weight per signer (instance storage). Absent signers
+    /// default to weight 1 (#48).
+    SignerWeights = 12,
     /// Monotonic signer configuration generation (instance storage).
-    SignerGeneration,
+    ///
+    /// Explicitly `8`, **not** the implicit `3` that follows `Threshold`:
+    /// `3` is the long-standing code of [`Self::NextProposalId`], and both are
+    /// unit variants, so sharing it made the proposal-ID counter and the
+    /// signer generation the *same* storage slot. `increment_proposal_id`
+    /// would then bump the generation, invalidating every queued proposal.
+    SignerGeneration = 8,
     /// Monotonic proposal ID counter (instance storage).
     NextProposalId = 3,
     /// Persistent record for a proposal (persistent storage, keyed by ID).
@@ -174,6 +204,9 @@ pub enum DataKey {
     SignerIndex = 6,
     /// Per-proposal Map<Address, bool> for O(1) duplicate-approval detection (persistent).
     ProposalApprovalIdx(u32) = 7,
+    /// In-flight flag set while a proposal's target call is being dispatched
+    /// (instance storage). The non-reentrancy guard tested against in #47.
+    Executing = 11,
 }
 
 // ---------------------------------------------------------------------------
@@ -587,6 +620,16 @@ fn read_next_proposal_id(env: &Env) -> u32 {
         .instance()
         .get(&DataKey::NextProposalId)
         .unwrap_or(0u32)
+}
+
+/// The configured post-`eta` execution window (#46), falling back to
+/// [`DEFAULT_GRACE_PERIOD_SECONDS`] so views never fail on a contract where
+/// `set_grace_period` has not been called (including before `init`).
+fn get_grace_period(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::GracePeriod)
+        .unwrap_or(DEFAULT_GRACE_PERIOD_SECONDS)
 }
 
 fn checked_deadline(start: u64, seconds: u64) -> Result<u64, GovernanceError> {
@@ -1021,6 +1064,8 @@ impl FluxoraGovernance {
             approvals: Vec::new(&env),
             approval_weight: 0,
             created_at: now,
+            eta: 0,
+            signer_generation: get_signer_generation(&env),
             status: ProposalStatus::Proposed,
             executed: false,
             cancelled: false,
@@ -1107,6 +1152,7 @@ impl FluxoraGovernance {
         let now = env.ledger().timestamp();
         let quorum_reached = if approval_count == threshold {
             let executable_after = checked_deadline(now, GOVERNANCE_TIMELOCK_SECONDS)?;
+            proposal.eta = executable_after;
             proposal.status = ProposalStatus::Queued;
             Some((now, executable_after))
         } else {
@@ -1452,6 +1498,32 @@ impl FluxoraGovernance {
     /// Read a proposal by ID.
     pub fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, GovernanceError> {
         load_proposal(&env, proposal_id)
+    }
+
+    /// Return the proposal-level execution timestamp (`eta`).
+    pub fn get_proposal_eta(env: Env, proposal_id: u32) -> Result<u64, GovernanceError> {
+        Ok(load_proposal(&env, proposal_id)?.eta)
+    }
+
+    /// Return the configured grace period in seconds.
+    ///
+    /// Returns `DEFAULT_GRACE_PERIOD_SECONDS` before `init` has been called.
+    pub fn grace_period(env: Env) -> u64 {
+        bump_instance(&env);
+        get_grace_period(&env)
+    }
+
+    /// Set the post-`eta` execution window, in seconds.
+    ///
+    /// # Authorization
+    /// - Requires the current admin signature.
+    pub fn set_grace_period(env: Env, grace_period: u64) -> Result<(), GovernanceError> {
+        get_admin(&env)?.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::GracePeriod, &grace_period);
+        bump_instance(&env);
+        Ok(())
     }
 
     /// Return the current lifecycle state of a proposal.
