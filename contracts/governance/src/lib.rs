@@ -1465,6 +1465,19 @@ impl FluxoraGovernance {
     /// 2. Non-reentrancy guard: the `Executing` in-flight flag rejects *any*
     ///    reentrant `execute` — including for a different proposal — while a
     ///    dispatch is in progress.
+    ///
+    /// # Failure recovery (#53)
+    ///
+    /// If the dispatched call fails, the whole transaction fails and the host
+    /// unwinds it. The proposal is therefore left `Queued` with
+    /// `executed == false`, the target is untouched, no `proposal_executed` is
+    /// emitted, and the `Executing` flag is cleared — all of which happen
+    /// because those writes are part of the same transaction as the target call.
+    ///
+    /// The practical effect is that a transient downstream failure is retryable:
+    /// the proposal stays executable for the remainder of its grace window. A
+    /// failure that never clears expires with that window, returning
+    /// `ProposalExpired`. See `docs/governance-failure-recovery.md`.
     pub fn execute(env: Env, executor: Address, proposal_id: u32) -> Result<(), GovernanceError> {
         executor.require_auth();
 
@@ -5206,5 +5219,181 @@ mod tests {
             sealed - 50_000,
             "the quorum view extended an executed proposal's snapshot"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Failure recovery (issue #53)
+    //
+    // #51 proved atomicity for *batch* payloads. This section covers the other
+    // half: what the contract promises after a target call fails.
+    //
+    // The guarantee is not implemented in this contract — it is the host's. A
+    // trap inside the dispatched call unwinds the whole transaction, so the
+    // CEI write that marked the proposal `Executed` is rolled back along with
+    // everything the target did. The proposal is therefore still `Queued` and
+    // still executable, and a transient downstream lock can simply be retried.
+    //
+    // What these tests pin is therefore a *behaviour*, not a mechanism: after a
+    // failure the observable state must be indistinguishable from before the
+    // attempt, and the retry window must not have been consumed.
+    // -----------------------------------------------------------------------
+
+    /// A single-call proposal whose target traps must leave no trace — the
+    /// single-call counterpart to #51's batch atomicity test.
+    ///
+    /// This is the case the batch test cannot reach: there is no earlier entry
+    /// to unwind, so the only thing that could be corrupted is the proposal's
+    /// own execution state.
+    #[test]
+    fn test_single_call_target_failure_reverts_execution_state() {
+        let ctx = Ctx::setup();
+        let flaky = deploy_flaky_target(&ctx);
+        let client = FlakyTargetClient::new(&ctx.env, &flaky);
+        client.set_failing(&true);
+
+        let id = queued(&ctx, &flaky, &set_cap(&ctx.env, 9));
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+
+        let executor = Address::generate(&ctx.env);
+        assert!(
+            ctx.client.try_execute(&executor, &id).is_err(),
+            "a trapping target call must fail the whole execution"
+        );
+
+        // The target wrote nothing...
+        assert_eq!(client.cap(), 0);
+        // ...and, critically, the proposal's own execution state was rolled back
+        // with it. If CEI were not transactional, `executed` would be stuck true
+        // here and the proposal could never be retried.
+        let proposal = ctx.client.get_proposal(&id);
+        assert!(!proposal.executed);
+        assert_eq!(proposal.status, ProposalStatus::Queued);
+        assert_eq!(
+            executed_event_count(&ctx.env, &ctx.contract_id),
+            0,
+            "a failed execution must not emit proposal_executed"
+        );
+    }
+
+    /// The retry window is the operational payload of #53: after a failure the
+    /// proposal must remain executable, and remain so for the *whole* remaining
+    /// grace period rather than being consumed by the failed attempt.
+    #[test]
+    fn test_failed_execution_leaves_the_proposal_executable() {
+        let ctx = Ctx::setup();
+        let flaky = deploy_flaky_target(&ctx);
+        let client = FlakyTargetClient::new(&ctx.env, &flaky);
+        client.set_failing(&true);
+
+        let id = queued(&ctx, &flaky, &set_cap(&ctx.env, 9));
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        assert!(ctx.client.try_execute(&Address::generate(&ctx.env), &id).is_err());
+
+        // Still executable immediately after the failure.
+        assert!(
+            ctx.client.is_executable(&id),
+            "a transient failure must leave the proposal executable"
+        );
+
+        // And still executable much later inside the grace window: the failed
+        // attempt must not have shortened or reset the window.
+        let deadline = 1_000_000 + TIMELOCK + DEFAULT_GRACE_PERIOD_SECONDS;
+        ctx.env.ledger().set_timestamp(deadline - 1);
+        assert!(
+            ctx.client.is_executable(&id),
+            "the grace window must survive a failed execution intact"
+        );
+    }
+
+    /// A transient lock clears and the same proposal then executes, exactly once.
+    ///
+    /// The pair with `test_failed_execution_leaves_the_proposal_executable`:
+    /// staying executable is only useful if a retry actually succeeds, and the
+    /// retry must apply the payload once rather than twice.
+    #[test]
+    fn test_single_call_target_failure_is_recoverable_on_retry() {
+        let ctx = Ctx::setup();
+        let flaky = deploy_flaky_target(&ctx);
+        let client = FlakyTargetClient::new(&ctx.env, &flaky);
+        client.set_failing(&true);
+
+        let id = queued(&ctx, &flaky, &set_cap(&ctx.env, 9));
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        assert!(ctx.client.try_execute(&Address::generate(&ctx.env), &id).is_err());
+        assert_eq!(client.cap(), 0);
+
+        // The downstream lock clears; the proposal is retried unchanged.
+        client.set_failing(&false);
+        ctx.client.execute(&Address::generate(&ctx.env), &id);
+
+        assert_eq!(client.cap(), 9, "the retry must apply the payload");
+        let proposal = ctx.client.get_proposal(&id);
+        assert!(proposal.executed);
+        assert_eq!(proposal.status, ProposalStatus::Executed);
+        assert_eq!(
+            executed_event_count(&ctx.env, &ctx.contract_id),
+            1,
+            "only the successful attempt may emit proposal_executed"
+        );
+    }
+
+    /// A failed dispatch must not leave the non-reentrancy guard latched.
+    ///
+    /// `execute` raises the `Executing` flag around the target call and lowers it
+    /// afterwards. If a trap could leave the flag set, every *subsequent*
+    /// execution — of this proposal or any other — would be permanently rejected
+    /// with `ReentrancyGuard`, turning one transient failure into a permanent
+    /// governance outage. The rollback has to take the flag with it.
+    #[test]
+    fn test_failed_dispatch_does_not_latch_the_reentrancy_guard() {
+        let ctx = Ctx::setup();
+        let flaky = deploy_flaky_target(&ctx);
+        let client = FlakyTargetClient::new(&ctx.env, &flaky);
+        client.set_failing(&true);
+
+        let failing_id = queued(&ctx, &flaky, &set_cap(&ctx.env, 9));
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        assert!(ctx
+            .client
+            .try_execute(&Address::generate(&ctx.env), &failing_id)
+            .is_err());
+
+        // A second, healthy proposal must still be executable. If the guard were
+        // latched, this would be rejected with ReentrancyGuard instead.
+        let healthy = deploy_batch_target(&ctx);
+        let healthy_id = queued(&ctx, &healthy, &set_cap(&ctx.env, 4));
+        assert!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &healthy_id).is_ok(),
+            "a failed dispatch left the reentrancy guard latched"
+        );
+        assert_eq!(BatchTargetClient::new(&ctx.env, &healthy).cap(), 4);
+    }
+
+    /// The retry window closes. A failure that is never cleared does not keep a
+    /// proposal alive forever: past the grace deadline it is `ProposalExpired`,
+    /// so a permanently broken target cannot pin storage and quorum attention
+    /// indefinitely.
+    #[test]
+    fn test_unrecovered_failure_expires_at_the_end_of_the_grace_period() {
+        let ctx = Ctx::setup();
+        let flaky = deploy_flaky_target(&ctx);
+        let client = FlakyTargetClient::new(&ctx.env, &flaky);
+        client.set_failing(&true);
+
+        let id = queued(&ctx, &flaky, &set_cap(&ctx.env, 9));
+        let deadline = 1_000_000 + TIMELOCK + DEFAULT_GRACE_PERIOD_SECONDS;
+
+        // The boundary is inclusive: execution is still allowed exactly at the
+        // deadline, and refused only after it.
+        ctx.env.ledger().set_timestamp(deadline);
+        assert!(ctx.client.is_executable(&id));
+
+        ctx.env.ledger().set_timestamp(deadline + 1);
+        assert!(!ctx.client.is_executable(&id));
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &id),
+            Err(Ok(GovernanceError::ProposalExpired))
+        );
+        assert_eq!(client.cap(), 0);
     }
 }
