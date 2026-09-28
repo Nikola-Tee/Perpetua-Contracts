@@ -16,23 +16,35 @@ replace the contract event's stream ID, event-specific payload, or event order.
 
 ## Perpetua event model
 
-The stream contract emits these event types:
+The stream contract emits ten event types. `topic[0]` is always the event name
+in snake case, and `topic[1]` is always `stream_id`; the remaining slots hold
+the parties the event routes on.
 
-- `stream_created`: `stream_id`, `sender`, and `recipient` are topics; the
-  payload contains the complete initial stream state.
-- `withdrawn`: `stream_id` and `recipient` are topics; the payload contains the
-  amount and cumulative accounting fields.
-- `cancelled`: `stream_id`, `sender`, and `recipient` are topics.
-- `paused` and `resumed`: `stream_id` and `sender` are topics.
-- `topped_up`: `stream_id` and `sender` are topics.
-- `recipient_transferred`: `stream_id`, `old_recipient`, and `new_recipient`
-  are topics.
-- `delegate_granted`: `stream_id`, `grantor`, and `delegate` are topics.
-- `delegate_revoked`: `stream_id`, `grantor`, and `delegate` are topics.
-- `ttl_extended`: `stream_id` is a topic.
+| event | topic[1] | topic[2] | topic[3] |
+|---|---|---|---|
+| `stream_created` | `stream_id` | `sender` | `recipient` |
+| `withdrawn` | `stream_id` | `recipient` | — |
+| `cancelled` | `stream_id` | `sender` | `recipient` |
+| `paused` | `stream_id` | `sender` | — |
+| `resumed` | `stream_id` | `sender` | — |
+| `topped_up` | `stream_id` | `sender` | — |
+| `recipient_transferred` | `stream_id` | `old_recipient` | `new_recipient` |
+| `delegate_granted` | `stream_id` | `grantor` | `delegate` |
+| `delegate_revoked` | `stream_id` | `grantor` | `delegate` |
+| `ttl_extended` | `stream_id` | — | — |
 
-The event topic vector starts with the event name in snake case. For example,
-a `StreamCreated` event has a topic vector conceptually shaped like:
+**Topic arity is not constant.** It ranges from 2 (`ttl_extended`) to 4
+(`stream_created`, `cancelled`, `recipient_transferred`, and both delegate
+events). A consumer must read the topic count per event rather than assuming
+four entries.
+
+`stream_created` carries the complete initial stream state in its payload and
+is the bootstrap event for building a sender/recipient mapping. `withdrawn`
+carries the amount and cumulative accounting fields. The full payload layout
+and the ordering rationale are in [ABI.md](ABI.md#topic-positions), which is
+the interface of record.
+
+A `stream_created` event's topic vector is therefore:
 
 ```text
 ["stream_created", stream_id, sender, recipient]

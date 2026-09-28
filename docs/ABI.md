@@ -184,21 +184,73 @@ is derived from the *event* budget rather than the entry count.
 
 ## Events
 
-Declared with `#[contractevent]`; schemas are in the deployed spec. First topic
-is the snake_case event name, second is always `stream_id`.
+Declared with `#[contractevent]`; schemas are in the deployed spec. Every event's
+topic vector is `[symbol, stream_id, ...]` where `symbol` is the snake_case
+struct name, followed by zero or more routing topics in the order shown.
+
+### Topic positions
+
+Positions are absolute, so an indexer can address a topic by index without
+decoding the payload. `—` means the event has no topic at that index.
+
+| event | topic[0] | topic[1] | topic[2] | topic[3] |
+|---|---|---|---|---|
+| `stream_created` | `stream_created` | `stream_id` | `sender` | `recipient` |
+| `withdrawn` | `withdrawn` | `stream_id` | `recipient` | — |
+| `cancelled` | `cancelled` | `stream_id` | `sender` | `recipient` |
+| `paused` | `paused` | `stream_id` | `sender` | — |
+| `resumed` | `resumed` | `stream_id` | `sender` | — |
+| `topped_up` | `topped_up` | `stream_id` | `sender` | — |
+| `recipient_transferred` | `recipient_transferred` | `stream_id` | `old_recipient` | `new_recipient` |
+| `delegate_granted` | `delegate_granted` | `stream_id` | `grantor` | `delegate` |
+| `delegate_revoked` | `delegate_revoked` | `stream_id` | `grantor` | `delegate` |
+| `ttl_extended` | `ttl_extended` | `stream_id` | — | — |
+
+`topic[1]` is `stream_id` for **all ten** events without exception, which is
+what makes a single "all events for stream N" filter possible. Topic arity
+varies from 2 to 4 depending on how many parties the event routes on, so a
+consumer must not assume four topics.
+
+### Ordering rule
+
+Topics are ordered by *role*, not by a fixed global pattern:
+
+1. `stream_id` — always first, because it is the only universal join key.
+2. The **initiating party** (`sender`, `grantor`).
+3. The **counterparty**, when the event describes a relationship rather than a
+   unilateral action (`recipient`, `delegate`, `new_recipient`).
+
+Events that only one party acts on (`paused`, `resumed`, `topped_up`) stop
+after topic[2]. `ttl_extended` is a keeper maintenance event with no party in
+it at all, so it carries `stream_id` alone.
+
+`recipient_transferred` is deliberately `old_recipient` then `new_recipient`:
+an indexer filtering "streams where X is the new recipient" must be able to
+target topic[3] without also matching every stream where X is the old one.
+Reversing those two would silently break that filter.
+
+### Payloads
 
 | event | topics after the name | payload |
 |---|---|---|
 | `stream_created` | `stream_id`, `sender`, `recipient` | `token`, `deposited`, `start_time`, `end_time`, `cliff_time`, `cancellable`, `pausable`, `transferable` |
 | `withdrawn` | `stream_id`, `recipient` | `amount`, `withdrawn`, `deposited`, `status` |
-
-`stream_created` is the bootstrap event indexers use to reconstruct a stream's initial state. It is the only source of the per-stream metadata needed to build a sender/recipient mapping before any later lifecycle event arrives.
 | `cancelled` | `stream_id`, `sender`, `recipient` | `refunded`, `vested`, `withdrawn`, `end_time` |
 | `paused` | `stream_id`, `sender` | `paused_at`, `paused_total` |
 | `resumed` | `stream_id`, `sender` | `paused_duration`, `paused_total` |
 | `topped_up` | `stream_id`, `sender` | `amount`, `deposited`, `end_time` |
 | `recipient_transferred` | `stream_id`, `old_recipient`, `new_recipient` | — |
+| `delegate_granted` | `stream_id`, `grantor`, `delegate` | `ops`, `expires_at` |
+| `delegate_revoked` | `stream_id`, `grantor`, `delegate` | — |
 | `ttl_extended` | `stream_id` | `extended_to_ledgers` |
+
+`stream_created` is the bootstrap event indexers use to reconstruct a stream's
+initial state. It is the only source of the per-stream metadata needed to build
+a sender/recipient mapping before any later lifecycle event arrives.
+
+`recipient_transferred` and `delegate_revoked` carry an empty payload: every
+field they route on is already a topic, so there is nothing left to put in the
+data slot.
 
 Every payload carries enough state to reconstruct the stream without replaying
 from genesis. Field order and topic placement are ABI.
