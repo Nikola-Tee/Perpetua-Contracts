@@ -105,3 +105,22 @@ This ordering is verified by `withdrawal_atomicity.rs`, which engineers two
 failure modes — SAC `set_authorized(recipient, false)` and an always-panicking
 token contract — and asserts that stream state and token balances are
 byte-for-byte identical before and after the failed call.
+
+## Governance Contract - `fluxora_governance`
+
+Whether a governed target can be mutated without passing the timelock is
+audited separately in [governance-timelock-audit.md](./governance-timelock-audit.md).
+Summary of that audit:
+
+- `execute` is the only entrypoint that reaches a target. The
+  `impl FluxoraGovernance` block contains no `invoke_contract` call at all; the
+  single dispatch site is the free function `dispatch_call`, reached from
+  `execute` after auth, reentrancy, status, max-age, signer-generation, quorum,
+  both timelock checks and the grace window.
+- 32 entrypoints are inventoried in that document; the 12 state-mutating ones
+  are asserted to `require_auth`, and the only unauthenticated non-view
+  entrypoints are `init` and `prune_expired_proposals`.
+- Negative tests execute real proposals against a governed mock target and
+  assert the target's state is untouched for every bypass attempt (early
+  execution, one second early, missing quorum, cancelled, executed, expired,
+  non-signer, admin, rogue direct call).

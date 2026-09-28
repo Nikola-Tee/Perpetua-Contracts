@@ -4162,10 +4162,8 @@ mod tests {
         ctx.client.approve(&ctx.signer_a, &id);
         ctx.client.approve(&ctx.signer_b, &id);
         assert!(!ctx.client.is_executable(&id));
-        assert_eq!(
-            ctx.client.try_execute(&executor, &id),
-            Err(Ok(GovernanceError::TimelockNotMet))
-        );
+        let result = ctx.client.try_execute(&executor, &id);
+        assert_eq!(result, Err(Ok(GovernanceError::TimelockNotMet)));
 
         // --- Post-timelock, executable ---
         ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
@@ -4576,6 +4574,275 @@ mod tests {
 
         /// Traps while the target is failing, so governance's dispatch panics
         /// and the host unwinds the entire transaction.
+    // Timelock bypass audit (issue #50)
+    //
+    // Two layers:
+    //   * `test_static_audit_*` parse this file's own source at compile time
+    //     (`include_str!("lib.rs")`) and pin the shape of the dispatch graph.
+    //   * the `test_negative_*` / `test_positive_*` cases drive real proposals
+    //     against `MockTarget`, a governed contract whose only setter requires
+    //     the controller's authorization. The mock's own state is therefore
+    //     ground truth for "did governance dispatch, or not?".
+    //
+    // The write-up is docs/governance-timelock-audit.md.
+    // -----------------------------------------------------------------------
+
+    /// The contract's own source, embedded so the static audit below inspects
+    /// the code that is actually compiled rather than a copy of it.
+    const SOURCE: &str = include_str!("lib.rs");
+
+    /// `SOURCE` with line endings normalised to `\n`, so the needles below
+    /// behave the same in a CRLF working tree (Windows checkouts) and in the
+    /// LF tree CI builds.
+    fn source() -> &'static str {
+        static NORMALIZED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        NORMALIZED.get_or_init(|| SOURCE.replace("\r\n", "\n"))
+    }
+
+    /// The full `impl FluxoraGovernance` block: public entrypoints *and* the
+    /// private methods they call.
+    fn impl_block() -> &'static str {
+        let source = source();
+        let start = source
+            .find("impl FluxoraGovernance {")
+            .expect("the contract impl block must exist");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("the contract impl block must be closed at column 0");
+        &rest[..end]
+    }
+
+    /// The source of a single entrypoint: its signature through to the next
+    /// entrypoint, so a body cannot borrow a sibling's text.
+    fn entrypoint_source(name: &str) -> &'static str {
+        let block = impl_block();
+        let needle = format!("\n    pub fn {name}(");
+        let start = block
+            .find(&needle)
+            .unwrap_or_else(|| panic!("entrypoint `{name}` is not declared"));
+        let end = block[start + 1..]
+            .find("\n    pub fn ")
+            .map_or(block.len() - start, |i| i + 1);
+        &block[start..start + end]
+    }
+
+    fn count_occurrences(haystack: &str, needle: &str) -> u32 {
+        haystack.matches(needle).count() as u32
+    }
+
+    /// Every public entrypoint of `FluxoraGovernance`, in declaration order.
+    ///
+    /// `test_static_audit_entrypoint_inventory_is_complete` fails if this list
+    /// and the contract ever drift apart, so a new entrypoint cannot escape
+    /// the audit below.
+    const ENTRYPOINTS: &[&str] = &[
+        "init",
+        "set_admin",
+        "set_emergency_guardians",
+        "set_threshold",
+        "set_vote_weight",
+        "vote_weight",
+        "add_signer",
+        "remove_signer",
+        "update_threshold",
+        "propose",
+        "approve",
+        "execute",
+        "cancel_proposal",
+        "prune_expired_proposals",
+        "get_proposal",
+        "get_proposal_eta",
+        "grace_period",
+        "set_grace_period",
+        "get_proposal_status",
+        "is_proposal_in_status",
+        "proposal_count",
+        "get_signers",
+        "get_admin",
+        "get_emergency_guardians",
+        "get_threshold",
+        "quorum",
+        "timelock_seconds",
+        "max_proposal_age_seconds",
+        "get_quorum_info",
+        "is_executable",
+        "is_signer",
+        "get_proposals_by_id_range",
+    ];
+
+    /// Entrypoints that mutate contract state and therefore must authenticate
+    /// their caller.
+    ///
+    /// `init` is deliberately excluded: it is the one-time bootstrap and has no
+    /// admin yet (see residual risks in docs/governance-timelock-audit.md).
+    /// `prune_expired_proposals` is excluded because it is permissionless
+    /// maintenance that can only delete entries which are already past
+    /// `created_at + MAX_PROPOSAL_AGE_SECONDS`, i.e. entries `execute` already
+    /// refuses; it can never reach a governed target.
+    const STATE_MUTATING_ENTRYPOINTS: &[&str] = &[
+        "set_admin",
+        "set_emergency_guardians",
+        "set_threshold",
+        "set_vote_weight",
+        "add_signer",
+        "remove_signer",
+        "update_threshold",
+        "propose",
+        "approve",
+        "execute",
+        "cancel_proposal",
+        "set_grace_period",
+    ];
+
+    // -- static audit -------------------------------------------------------
+
+    /// The whole `impl` block — entrypoints and private methods alike — must
+    /// contain no cross-contract invocation. The only path to a target is the
+    /// free function `dispatch_call`, which is not an entrypoint and therefore
+    /// cannot be called by a transaction.
+    #[test]
+    fn test_static_audit_contract_impl_never_invokes_a_contract_directly() {
+        assert!(
+            !impl_block().contains("invoke_contract"),
+            "no entrypoint (public or private) may invoke a contract; \
+             every target call must go through dispatch_call"
+        );
+        assert!(
+            !impl_block().contains("fn dispatch_call("),
+            "dispatch_call must stay a free function outside the impl block"
+        );
+    }
+
+    /// `execute` is the only entrypoint that dispatches a target call.
+    #[test]
+    fn test_static_audit_execute_is_the_only_dispatch_site() {
+        assert_eq!(
+            count_occurrences(impl_block(), "dispatch_call("),
+            1,
+            "exactly one entrypoint may call dispatch_call"
+        );
+        for name in ENTRYPOINTS {
+            assert_eq!(
+                entrypoint_source(name).contains("dispatch_call("),
+                *name == "execute",
+                "{name} dispatch check failed"
+            );
+        }
+    }
+
+    /// In `execute`'s own source, every gate precedes the dispatch.
+    ///
+    /// This is the test that fails if someone reorders the body to dispatch
+    /// first and validate afterwards, or drops one of the gates.
+    #[test]
+    fn test_static_audit_execute_dispatches_after_every_gate() {
+        let body = entrypoint_source("execute");
+        let dispatch = body
+            .find("dispatch_call(")
+            .expect("execute dispatches through dispatch_call");
+        for gate in [
+            "executor.require_auth",
+            "ReentrancyGuard",
+            "ProposalCancelled",
+            "AlreadyExecuted",
+            "ProposalExpired",
+            "InvalidSignerGeneration",
+            "QuorumNotReached",
+            "TimelockNotMet",
+        ] {
+            let at = body
+                .find(gate)
+                .unwrap_or_else(|| panic!("execute no longer enforces {gate}"));
+            assert!(at < dispatch, "{gate} must be checked before dispatching");
+        }
+    }
+
+    /// Checks-effects-interactions: the proposal is marked executed and the
+    /// reentrancy flag is raised *before* the untrusted call. If either write
+    /// moved after the dispatch, `execute` would be reentrant (#47).
+    #[test]
+    fn test_static_audit_execute_applies_cei_before_dispatch() {
+        let body = entrypoint_source("execute");
+        let dispatch = body.find("dispatch_call(").expect("execute dispatches");
+        for effect in [
+            "proposal.status = ProposalStatus::Executed",
+            "Executing, &true",
+        ] {
+            let at = body
+                .find(effect)
+                .unwrap_or_else(|| panic!("execute no longer performs `{effect}`"));
+            assert!(at < dispatch, "`{effect}` must precede the dispatch (CEI)");
+        }
+    }
+
+    /// Every state-mutating entrypoint still authenticates its caller.
+    #[test]
+    fn test_static_audit_state_mutating_entrypoints_require_auth() {
+        for name in STATE_MUTATING_ENTRYPOINTS {
+            assert!(
+                entrypoint_source(name).contains("require_auth"),
+                "{name} must require auth before mutating state"
+            );
+        }
+    }
+
+    /// The audited inventory matches the contract exactly: a renamed, added or
+    /// removed entrypoint fails here rather than slipping past the audit.
+    #[test]
+    fn test_static_audit_entrypoint_inventory_is_complete() {
+        for name in ENTRYPOINTS {
+            // `entrypoint_source` panics if the entrypoint is not declared.
+            assert!(entrypoint_source(name).contains("pub fn "));
+        }
+        assert_eq!(
+            count_occurrences(impl_block(), "\n    pub fn "),
+            ENTRYPOINTS.len() as u32,
+            "every public entrypoint must appear in the audit inventory"
+        );
+    }
+
+    // -- dynamic negative tests ---------------------------------------------
+
+    use soroban_sdk::InvokeError;
+
+    /// Storage keys for [`MockTarget`].
+    #[contracttype]
+    #[derive(Clone, Debug)]
+    pub enum MockTargetKey {
+        /// The only address permitted to mutate this mock — the governance
+        /// contract in every test below.
+        Controller,
+        /// Number of accepted state-mutating calls received so far.
+        CallCount,
+        /// Value written by the guarded setter.
+        Cap,
+    }
+
+    /// Stand-in for a governed protocol contract.
+    ///
+    /// `set_cap` is the entrypoint that `CallData::FactorySetCap` dispatches to.
+    /// It requires the controller's authorization, so the only way to change
+    /// the mock's state is *through* the governance contract — which is what
+    /// makes the negative tests meaningful: a timelock bypass would show up
+    /// here as `call_count() > 0` or `cap() != 0` before the timelock elapsed.
+    #[contract]
+    pub struct MockTarget;
+
+    #[contractimpl]
+    impl MockTarget {
+        /// Record the address allowed to mutate this mock. Callable by anyone:
+        /// it only stores the expectation, it mutates no governed state.
+        pub fn init(env: Env, controller: Address) {
+            env.storage()
+                .instance()
+                .set(&MockTargetKey::Controller, &controller);
+            env.storage()
+                .instance()
+                .set(&MockTargetKey::CallCount, &0u32);
+        }
+
+        /// The governed setter, reached only via `dispatch_call`.
         pub fn set_cap(env: Env, cap: i128) {
             let controller: Address = env
                 .storage()
@@ -4666,6 +4933,69 @@ mod tests {
     /// Queue a proposal for `calldata` and advance past the timelock.
     fn queued(ctx: &Ctx, target: &Address, calldata: &Bytes) -> u32 {
         let id = ctx.client.propose(&ctx.signer_a, target, calldata);
+                .get(&MockTargetKey::Controller)
+                .expect("controller set");
+            controller.require_auth();
+            let calls: u32 = env
+                .storage()
+                .instance()
+                .get(&MockTargetKey::CallCount)
+                .expect("call count set");
+            env.storage()
+                .instance()
+                .set(&MockTargetKey::CallCount, &calls + 1);
+            env.storage().instance().set(&MockTargetKey::Cap, &cap);
+        }
+
+        pub fn call_count(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&MockTargetKey::CallCount)
+                .unwrap_or(0)
+        }
+
+        pub fn cap(env: Env) -> i128 {
+            env.storage()
+                .instance()
+                .get(&MockTargetKey::Cap)
+                .unwrap_or(0)
+        }
+    }
+
+    /// A contract whose only purpose is the classic bypass shape: mutate a
+    /// governed target directly, from outside governance.
+    #[contract]
+    pub struct RogueCaller;
+
+    #[contractimpl]
+    impl RogueCaller {
+        pub fn try_set_cap(env: Env, target: Address) {
+            env.invoke_contract::<()>(
+                &target,
+                &Symbol::new(&env, "set_cap"),
+                (1i128,).into_val(&env),
+            );
+        }
+    }
+
+    /// XDR-encoded `CallData::FactorySetCap` payload.
+    fn set_cap_calldata(env: &Env, cap: i128) -> Bytes {
+        use soroban_sdk::xdr::ToXdr;
+        CallData::FactorySetCap(cap).to_xdr(env)
+    }
+
+    /// Register a `MockTarget` governed by `ctx` and return its address.
+    fn deploy_target(ctx: &Ctx) -> Address {
+        let target = ctx.env.register(MockTarget, ());
+        MockTargetClient::new(&ctx.env, &target).init(&ctx.contract_id);
+        target
+    }
+
+    /// Propose a `set_cap` payload, bring it to quorum, and return its ID.
+    fn queued_set_cap_proposal(ctx: &Ctx, target: &Address, cap: i128) -> u32 {
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, target, &set_cap_calldata(&ctx.env, cap));
         ctx.client.approve(&ctx.signer_a, &id);
         ctx.client.approve(&ctx.signer_b, &id);
         id
@@ -5395,5 +5725,244 @@ mod tests {
             Err(Ok(GovernanceError::ProposalExpired))
         );
         assert_eq!(client.cap(), 0);
+    /// Plausible backdoor entrypoint names — none of them may exist.
+    #[test]
+    fn test_no_backdoor_entrypoint_is_reachable() {
+        let ctx = Ctx::setup();
+        for name in ["bypass", "dispatch", "forcecall", "raw_call", "force_exec"] {
+            let sym = Symbol::new(&ctx.env, name);
+            let args = (0u32,).into_val(&ctx.env);
+            assert!(
+                ctx.env
+                    .try_invoke_contract::<(), InvokeError>(&ctx.contract_id, &sym, args)
+                    .is_err(),
+                "unexpected entrypoint {name} on the governance contract"
+            );
+        }
+    }
+
+    #[test]
+    fn test_negative_execute_before_timelock_leaves_target_untouched() {
+        let ctx = Ctx::setup();
+        let target = deploy_target(&ctx);
+        let target_client = MockTargetClient::new(&ctx.env, &target);
+        let id = queued_set_cap_proposal(&ctx, &target, 42);
+
+        let executor = Address::generate(&ctx.env);
+        assert!(!ctx.client.is_executable(&id));
+        assert_eq!(
+            ctx.client.try_execute(&executor, &id),
+            Err(Ok(GovernanceError::TimelockNotMet))
+        );
+        assert_eq!(target_client.call_count(), 0);
+        assert_eq!(target_client.cap(), 0);
+        assert!(!ctx.client.get_proposal(&id).executed);
+    }
+
+    /// No off-by-one window: the call is refused up to the last second.
+    #[test]
+    fn test_negative_execute_one_second_before_timelock_leaves_target_untouched() {
+        let ctx = Ctx::setup();
+        let target = deploy_target(&ctx);
+        let target_client = MockTargetClient::new(&ctx.env, &target);
+        let id = queued_set_cap_proposal(&ctx, &target, 42);
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK - 1);
+        let executor = Address::generate(&ctx.env);
+        assert_eq!(
+            ctx.client.try_execute(&executor, &id),
+            Err(Ok(GovernanceError::TimelockNotMet))
+        );
+        assert_eq!(target_client.call_count(), 0);
+    }
+
+    #[test]
+    fn test_negative_execute_without_quorum_leaves_target_untouched() {
+        let ctx = Ctx::setup();
+        let target = deploy_target(&ctx);
+        let target_client = MockTargetClient::new(&ctx.env, &target);
+        // A single approval against a threshold of two.
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &target, &set_cap_calldata(&ctx.env, 42));
+        ctx.client.approve(&ctx.signer_a, &id);
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        let executor = Address::generate(&ctx.env);
+        assert_eq!(
+            ctx.client.try_execute(&executor, &id),
+            Err(Ok(GovernanceError::QuorumNotReached))
+        );
+        assert_eq!(target_client.call_count(), 0);
+    }
+
+    #[test]
+    fn test_negative_cancelled_and_executed_proposals_cannot_reach_target() {
+        let ctx = Ctx::setup();
+        let target = deploy_target(&ctx);
+        let target_client = MockTargetClient::new(&ctx.env, &target);
+        let executor = Address::generate(&ctx.env);
+
+        // Two proposals, both queued at the same ledger timestamp.
+        let cancelled = queued_set_cap_proposal(&ctx, &target, 7);
+        let executed = queued_set_cap_proposal(&ctx, &target, 9);
+        ctx.client.cancel_proposal(&ctx.signer_a, &cancelled);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+
+        // The cancelled one never reaches the target, even past the timelock.
+        assert_eq!(
+            ctx.client.try_execute(&executor, &cancelled),
+            Err(Ok(GovernanceError::ProposalCancelled))
+        );
+        assert_eq!(target_client.call_count(), 0);
+
+        // The surviving one runs exactly once.
+        ctx.client.execute(&executor, &executed);
+        assert_eq!(target_client.call_count(), 1);
+        assert_eq!(target_client.cap(), 9);
+        assert_eq!(
+            ctx.client.try_execute(&executor, &executed),
+            Err(Ok(GovernanceError::AlreadyExecuted))
+        );
+        assert_eq!(target_client.call_count(), 1);
+    }
+
+    /// A proposal that aged out cannot be revived by waiting longer.
+    #[test]
+    fn test_negative_expired_proposal_cannot_reach_target() {
+        let ctx = Ctx::setup();
+        let target = deploy_target(&ctx);
+        let target_client = MockTargetClient::new(&ctx.env, &target);
+        let id = queued_set_cap_proposal(&ctx, &target, 42);
+
+        ctx.env.ledger().set_timestamp(1_000_000 + MAX_AGE + 1);
+        let executor = Address::generate(&ctx.env);
+        assert_eq!(
+            ctx.client.try_execute(&executor, &id),
+            Err(Ok(GovernanceError::ProposalExpired))
+        );
+        assert_eq!(target_client.call_count(), 0);
+        assert_eq!(target_client.cap(), 0);
+    }
+
+    #[test]
+    fn test_negative_non_signer_cannot_propose_or_approve() {
+        let ctx = Ctx::setup();
+        let target = deploy_target(&ctx);
+        let target_client = MockTargetClient::new(&ctx.env, &target);
+        let stranger = Address::generate(&ctx.env);
+
+        assert_eq!(
+            ctx.client
+                .try_propose(&stranger, &target, &set_cap_calldata(&ctx.env, 42)),
+            Err(Ok(GovernanceError::NotASigner))
+        );
+
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &target, &set_cap_calldata(&ctx.env, 42));
+        assert_eq!(
+            ctx.client.try_approve(&stranger, &id),
+            Err(Ok(GovernanceError::NotASigner))
+        );
+
+        // The stranger's failed approval did not manufacture quorum.
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        let executor = Address::generate(&ctx.env);
+        assert_eq!(
+            ctx.client.try_execute(&executor, &id),
+            Err(Ok(GovernanceError::QuorumNotReached))
+        );
+        assert_eq!(target_client.call_count(), 0);
+    }
+
+    #[test]
+    fn test_negative_admin_cannot_bypass_the_timelock() {
+        let ctx = Ctx::setup();
+        let target = deploy_target(&ctx);
+        let target_client = MockTargetClient::new(&ctx.env, &target);
+
+        // The admin is not a signer by default, so it cannot even propose.
+        assert!(!ctx.client.is_signer(&ctx.admin));
+        assert_eq!(
+            ctx.client
+                .try_propose(&ctx.admin, &target, &set_cap_calldata(&ctx.env, 42)),
+            Err(Ok(GovernanceError::NotASigner))
+        );
+
+        // Nor can it widen its own powers into a shortcut: being an emergency
+        // guardian buys cancellation, never early execution.
+        ctx.client
+            .set_emergency_guardians(&vec![&ctx.env, ctx.admin.clone()]);
+
+        // With every auth mocked, the admin still cannot skip the timelock.
+        let id = queued_set_cap_proposal(&ctx, &target, 42);
+        assert_eq!(
+            ctx.client.try_execute(&ctx.admin, &id),
+            Err(Ok(GovernanceError::TimelockNotMet))
+        );
+        assert_eq!(target_client.call_count(), 0);
+
+        // Nor can it cancel its way to an immediate dispatch.
+        ctx.client.cancel_proposal(&ctx.admin, &id);
+        assert_eq!(
+            ctx.client.try_execute(&ctx.admin, &id),
+            Err(Ok(GovernanceError::ProposalCancelled))
+        );
+        assert_eq!(target_client.call_count(), 0);
+    }
+
+    /// A third-party contract cannot move governed state directly: the target's
+    /// own controller check rejects the call because the rogue caller cannot
+    /// produce the governance contract's authorization.
+    ///
+    /// This test deliberately uses an env **without** `mock_all_auths`: with
+    /// every authorization mocked, `require_auth` is a no-op and the negative
+    /// case could not be observed at all.
+    #[test]
+    fn test_negative_rogue_contract_cannot_mutate_target_directly() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let contract_id = env.register_contract(None, FluxoraGovernance);
+        let admin = Address::generate(&env);
+        let signer = Address::generate(&env);
+        FluxoraGovernanceClient::new(&env, &contract_id).init(&admin, &vec![&env, signer], &1u32);
+
+        // The mock is governed by the governance contract. `init` needs no
+        // authorization; only the setter does.
+        let target = env.register(MockTarget, ());
+        MockTargetClient::new(&env, &target).init(&contract_id);
+        let target_client = MockTargetClient::new(&env, &target);
+
+        // An unrelated contract cannot move the target's state.
+        let rogue = env.register(RogueCaller, ());
+        let args = (target.clone(),).into_val(&env);
+        let res = env.try_invoke_contract::<(), InvokeError>(
+            &rogue,
+            &Symbol::new(&env, "try_set_cap"),
+            args,
+        );
+        assert!(res.is_err(), "rogue call must be rejected by the target");
+        assert_eq!(target_client.cap(), 0);
+        assert_eq!(target_client.call_count(), 0);
+    }
+
+    /// Positive counterpart: after the timelock, `execute` is the path that
+    /// actually mutates the governed target, and it does so exactly once.
+    #[test]
+    fn test_positive_execute_is_the_only_path_that_mutates_the_target() {
+        let ctx = Ctx::setup();
+        let target = deploy_target(&ctx);
+        let target_client = MockTargetClient::new(&ctx.env, &target);
+        let id = queued_set_cap_proposal(&ctx, &target, 42);
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        assert!(ctx.client.is_executable(&id));
+        let executor = Address::generate(&ctx.env);
+        ctx.client.execute(&executor, &id);
+
+        assert_eq!(target_client.call_count(), 1);
+        assert_eq!(target_client.cap(), 42);
+        assert!(ctx.client.get_proposal(&id).executed);
     }
 }
