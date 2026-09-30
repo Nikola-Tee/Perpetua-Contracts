@@ -20,6 +20,17 @@ const MAX_SIGNERS: u32 = 20;
 /// Maximum byte length for proposal calldata payload.
 const MAX_CALLDATA_BYTES: u32 = 4_096;
 
+/// Maximum number of operations in a single batch proposal (#51).
+///
+/// A batch is executed as a sequence of cross-contract invocations inside one
+/// transaction, so its cost is linear in this number. Five covers the policy
+/// updates that motivated batching (for example duration bounds *and*
+/// allowlist) with room to spare, while keeping the worst case well inside a
+/// transaction's instruction and rent budget. See
+/// `docs/governance-batch-proposals.md` for the bounds this was checked
+/// against, and for what is and is not measured.
+const MAX_BATCH_CALLS: u32 = 5;
+
 /// Maximum age in seconds for a proposal before it expires and becomes
 /// non-executable. Default: 30 days.
 const MAX_PROPOSAL_AGE_SECONDS: u64 = 2_592_000;
@@ -167,6 +178,12 @@ pub enum GovernanceError {
     /// The old code was unreachable: decoding `21` always resolved to
     /// `TimelockNotMet`.
     InvalidProposalState = 26,
+    /// A batch payload holds more than [`MAX_BATCH_CALLS`] operations.
+    ///
+    /// Bounds the worst-case instruction and rent cost of a single execution
+    /// (#51). The limit is structural, not a policy knob: no valid batch
+    /// exceeds it, so a proposal that trips it can never be executed.
+    BatchTooLarge = 27,
 }
 
 /// Storage keys for the governance contract.
@@ -213,20 +230,45 @@ pub enum DataKey {
 // Typed calldata adapter
 // ---------------------------------------------------------------------------
 
+/// One entry of a batch proposal: a target contract plus the XDR-encoded
+/// [`CallData`] describing what to do to it.
+///
+/// A batch is a list of these, so a single proposal can update several
+/// parameters — on one target or across several — inside one timelock cycle.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ExecutionCall {
+    /// Contract to invoke.
+    pub target: Address,
+    /// XDR-encoded single-operation [`CallData`]. Batches may not nest.
+    pub calldata: Bytes,
+}
+
 /// Typed encoding of every parameter change that governance is authorised to
 /// perform on-chain.  Proposers serialise one of these variants to XDR bytes
 /// via `.to_xdr(&env)` and pass the result as the `calldata` field of
 /// `propose`.  `execute` decodes the bytes with `CallData::from_xdr` and
 /// dispatches to the target contract.
 ///
+/// The wire form of a variant is its *name* (a `Symbol`), not its position, so
+/// adding a variant — [`Batch`](CallData::Batch) included — leaves every
+/// already-encoded proposal decodable.
+///
 /// Adding a new governed operation = adding a new variant here and a matching
-/// arm in `dispatch_call`.
+/// arm in `dispatch_operation`.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub enum CallData {
     // ---- no-op (for testing governance mechanics without a live target) ----
     /// No operation — dispatch performs no cross-contract call.
     Noop,
+
+    // ---- batch of operations (issue #51) ----
+    /// `Vec<ExecutionCall>` applied in order, all-or-nothing.
+    ///
+    /// Each entry's `calldata` must itself decode to a single-operation
+    /// variant; a nested `Batch` is rejected. Bounded by `MAX_BATCH_CALLS`.
+    Batch(Vec<ExecutionCall>),
 
     // ---- stream contract operations ----
     /// `set_admin(new_admin)`
@@ -257,12 +299,57 @@ pub enum CallData {
     FactorySetStreamWasmHash(BytesN<32>),
 }
 
+/// Decode `calldata` bytes into a `CallData` variant.
+fn decode_calldata(env: &Env, calldata: &Bytes) -> Result<CallData, GovernanceError> {
+    CallData::from_xdr(env, calldata).map_err(|_| GovernanceError::InvalidCalldata)
+}
+
 /// Decode `calldata` bytes into a `CallData` variant and invoke the target.
 /// Called inside `execute` *after* the proposal has been marked executed (CEI).
+///
+/// A [`CallData::Batch`] payload is applied in order, each entry carrying its
+/// own target. Atomicity is the host's: every write performed here — including
+/// the writes made by the earlier entries of a batch — is part of the
+/// transaction, so an error from any entry, or a trap in any target, unwinds
+/// all of them. A partially applied batch is not reachable.
 fn dispatch_call(env: &Env, target: &Address, calldata: &Bytes) -> Result<(), GovernanceError> {
-    let op = CallData::from_xdr(env, calldata).map_err(|_| GovernanceError::InvalidCalldata)?;
+    match decode_calldata(env, calldata)? {
+        CallData::Batch(calls) => {
+            if calls.is_empty() {
+                return Err(GovernanceError::InvalidCalldata);
+            }
+            if calls.len() > MAX_BATCH_CALLS {
+                return Err(GovernanceError::BatchTooLarge);
+            }
+            for call in calls.iter() {
+                let inner = decode_calldata(env, &call.calldata)?;
+                if matches!(inner, CallData::Batch(_)) {
+                    // Batches do not nest: nesting would let a proposal
+                    // exceed MAX_BATCH_CALLS by hiding calls one level down.
+                    return Err(GovernanceError::InvalidCalldata);
+                }
+                dispatch_operation(env, &call.target, inner)?;
+            }
+            Ok(())
+        }
+        // A single-operation proposal: dispatch to the proposal's own target.
+        op => dispatch_operation(env, target, op),
+    }
+}
+
+/// Invoke `target` for a single decoded operation. `op` is never
+/// [`CallData::Batch`]; `dispatch_call` handles that variant itself.
+///
+/// Takes `op` by value so each arm binds the same owned values the
+/// non-batch dispatch path has always passed to `invoke_contract`.
+fn dispatch_operation(env: &Env, target: &Address, op: CallData) -> Result<(), GovernanceError> {
     match op {
         CallData::Noop => {}
+        CallData::Batch(_) => {
+            // Unreachable: `dispatch_call` peels the batch off before calling
+            // here, and inner entries are rejected if they are batches.
+            return Err(GovernanceError::InvalidCalldata);
+        }
         CallData::StreamSetAdmin(new_admin) => {
             env.invoke_contract::<()>(
                 target,
@@ -335,8 +422,64 @@ fn dispatch_call(env: &Env, target: &Address, calldata: &Bytes) -> Result<(), Go
 
 const INSTANCE_LIFETIME_THRESHOLD: u32 = 17_280;
 const INSTANCE_BUMP_AMOUNT: u32 = 120_960;
+/// Threshold below which a proposal-scoped entry is topped up. The bump amount
+/// that goes with it is chosen per lifecycle state by the #52 retention policy
+/// ([`ACTIVE_PROPOSAL_BUMP_AMOUNT`] / [`TERMINAL_PROPOSAL_RETENTION`]),
+/// so there is deliberately no single persistent bump constant any more.
 const PERSISTENT_LIFETIME_THRESHOLD: u32 = 17_280;
-const PERSISTENT_BUMP_AMOUNT: u32 = 120_960;
+
+// ---------------------------------------------------------------------------
+// Proposal retention policy (#52)
+// ---------------------------------------------------------------------------
+
+/// Seconds per ledger on Stellar. TTL arguments are denominated in **ledgers**,
+/// not seconds, so every retention window below is converted from its
+/// wall-clock intent through this constant.
+const SECONDS_PER_LEDGER: u64 = 5;
+
+/// Convert a wall-clock window in seconds into the ledger count the host expects.
+///
+/// Saturating rather than wrapping: a misconfigured constant should clamp to the
+/// network maximum and trip the bounds test below, not silently wrap into a
+/// negative-length window.
+const fn ledgers(seconds: u64) -> u32 {
+    let count = seconds / SECONDS_PER_LEDGER;
+    if count > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        count as u32
+    }
+}
+
+/// TTL bump applied to a proposal-scoped entry while the proposal is still
+/// **active** (`Proposed` / `Approved` / `Queued`).
+///
+/// A proposal is never useful past `created_at + MAX_PROPOSAL_AGE_SECONDS`
+/// (30 days): `approve` and `execute` both reject it as `ProposalExpired` after
+/// that, and the quorum and grace windows are sized to land inside the same
+/// bound. Bumping past that whole span means one bump carries the entry beyond
+/// the last moment it could legally be read or written, so an active proposal
+/// cannot archive while it is still executable however long signers wait.
+///
+/// The extra week over `MAX_PROPOSAL_AGE_SECONDS` is deliberate headroom: the
+/// worst case is a bump landing exactly at `created_at`, after which the entry
+/// must survive one full max-age window. Remaining under the network's
+/// `max_entry_ttl` (6_312_000 ledgers, about a year) is asserted by
+/// `test_retention_windows_stay_within_network_limits`.
+const ACTIVE_PROPOSAL_BUMP_AMOUNT: u32 = ledgers(MAX_PROPOSAL_AGE_SECONDS + 604_800);
+
+/// Retention floor granted to a proposal that has just reached a **terminal**
+/// state (`Executed` / `Cancelled`).
+///
+/// Applied exactly once, at the moment the proposal becomes terminal, and never
+/// again. 30 days is the standard archival floor: long enough for indexers and
+/// auditors to reconcile the proposal against the events it emitted, after
+/// which the entry is left to decay back to the ledger's minimum rent instead of
+/// being held alive indefinitely by later reads.
+///
+/// Because the floor is never topped up, a terminal proposal's storage cost
+/// falls to zero once the window elapses — see `docs/governance-storage.md`.
+const TERMINAL_PROPOSAL_RETENTION: u32 = ledgers(2_592_000);
 
 // ---------------------------------------------------------------------------
 // Events
@@ -503,28 +646,100 @@ fn bump_instance(env: &Env) {
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 }
 
-fn bump_proposal(env: &Env, id: u32) {
-    env.storage().persistent().extend_ttl(
-        &DataKey::Proposal(id),
-        PERSISTENT_LIFETIME_THRESHOLD,
-        PERSISTENT_BUMP_AMOUNT,
-    );
+/// `true` once a proposal can never change state again.
+///
+/// Terminal proposals are the ones the retention policy stops paying for: they
+/// get a one-shot archival floor when they terminate and are never topped up
+/// again, so their rent decays instead of growing without bound (#52).
+fn is_terminal(status: &ProposalStatus) -> bool {
+    matches!(
+        status,
+        ProposalStatus::Executed | ProposalStatus::Cancelled
+    )
 }
 
-/// Extends the TTL of the QuorumReachedAt entry so it outlives the timelock.
-/// Called on every approve and execute to prevent archival before execution.
-fn bump_quorum_ttl(env: &Env, id: u32) {
-    if env
-        .storage()
-        .persistent()
-        .has(&DataKey::QuorumReachedAt(id))
-    {
+/// Apply the #52 retention policy to a single proposal-scoped persistent entry.
+///
+/// **Active** proposals are extended past their own maximum possible lifetime
+/// ([`ACTIVE_PROPOSAL_BUMP_AMOUNT`]), so a proposal that is still collecting
+/// votes — or queued behind its timelock — cannot archive before it is acted
+/// on, however long signers wait between votes.
+///
+/// **Terminal** proposals are skipped entirely. Their one-shot 30-day floor was
+/// already granted by [`seal_terminal_proposal`] at the transition, and topping
+/// it up again on every subsequent read is exactly the unbounded rent growth
+/// this policy exists to prevent.
+fn bump_active_entry(env: &Env, key: &DataKey, status: &ProposalStatus) {
+    if is_terminal(status) {
+        return;
+    }
+    // The host treats extending a non-existent or already-archived entry as an
+    // error, not a no-op, so every key is probed first. A proposal that has not
+    // reached quorum has no `QuorumReachedAt` entry, and one that has never
+    // been approved has no `ProposalApprovalIdx`.
+    if env.storage().persistent().has(key) {
         env.storage().persistent().extend_ttl(
-            &DataKey::QuorumReachedAt(id),
+            key,
             PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
+            ACTIVE_PROPOSAL_BUMP_AMOUNT,
         );
     }
+}
+
+/// Apply [`bump_active_entry`] to every persistent key a proposal owns.
+///
+/// A proposal's storage is three entries — the record itself, the quorum
+/// snapshot, and the duplicate-approval index. They are read and written
+/// together and share a lifetime, so they share one policy: keeping the record
+/// alive while the index or the quorum snapshot decays would corrupt the
+/// duplicate-approval check or the execution gates.
+fn bump_proposal_retention(env: &Env, id: u32, status: &ProposalStatus) {
+    bump_active_entry(env, &DataKey::Proposal(id), status);
+    bump_active_entry(env, &DataKey::QuorumReachedAt(id), status);
+    bump_active_entry(env, &DataKey::ProposalApprovalIdx(id), status);
+}
+
+/// Grant a proposal's storage the one-shot terminal retention floor (#52).
+///
+/// Called at the single moment a proposal becomes `Executed` or `Cancelled`.
+/// Every key it touches is topped up to [`TERMINAL_PROPOSAL_RETENTION`]
+/// (30 days) and, per [`bump_active_entry`], is never extended again — so after
+/// the window the entries decay to the ledger minimum and stop consuming rent.
+///
+/// The threshold is deliberately `PERSISTENT_LIFETIME_THRESHOLD`, not the
+/// retention window itself. The host only applies an extension when the entry's
+/// current TTL is at or below the threshold, so a threshold equal to the target
+/// would make this a no-op for any entry that still had a longer life left from
+/// its active bumps. A low threshold means "top up whenever this entry is
+/// anywhere near expiring", which is exactly the intent at a transition.
+fn seal_terminal_proposal(env: &Env, id: u32) {
+    for key in [
+        DataKey::Proposal(id),
+        DataKey::QuorumReachedAt(id),
+        DataKey::ProposalApprovalIdx(id),
+    ] {
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                TERMINAL_PROPOSAL_RETENTION,
+            );
+        }
+    }
+}
+
+/// `true` if the proposal exists and has reached a terminal state (#52).
+///
+/// Used by the read-only views, which hold a specific storage key rather than a
+/// loaded `Proposal` and so cannot pass a status to [`bump_active_entry`]
+/// directly. A proposal that cannot be found is reported as *not* terminal:
+/// there is no storage left to keep alive, so the distinction does not matter,
+/// and treating it as active keeps the caller's branch conservative.
+fn proposal_is_terminal(env: &Env, id: u32) -> bool {
+    env.storage()
+        .persistent()
+        .get::<DataKey, Proposal>(&DataKey::Proposal(id))
+        .is_some_and(|p| is_terminal(&p.status))
 }
 
 fn get_signer_index(env: &Env) -> Result<Map<Address, bool>, GovernanceError> {
@@ -538,37 +753,34 @@ fn save_signer_index(env: &Env, index: &Map<Address, bool>) {
     env.storage().instance().set(&DataKey::SignerIndex, index);
 }
 
-/// Extends the TTL of the per-proposal approval index so it outlives the
-/// proposal record. Called on every read and write of `ProposalApprovalIdx(id)`
-/// to prevent duplicate-approval detection from silently failing when the index
-/// archives before the proposal.
-fn bump_approval_index(env: &Env, proposal_id: u32) {
-    if env
-        .storage()
-        .persistent()
-        .has(&DataKey::ProposalApprovalIdx(proposal_id))
-    {
-        env.storage().persistent().extend_ttl(
-            &DataKey::ProposalApprovalIdx(proposal_id),
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-    }
-}
-
-fn get_approval_index(env: &Env, proposal_id: u32) -> Map<Address, bool> {
-    bump_approval_index(env, proposal_id);
+/// Read the per-proposal approval index, applying the #52 retention policy.
+///
+/// The index must outlive the proposal record it mirrors: if it decayed first,
+/// the duplicate-approval check would fall back to an empty map and a signer
+/// could approve the same proposal twice, so it is bumped together with the
+/// record rather than independently.
+fn get_approval_index(
+    env: &Env,
+    proposal_id: u32,
+    status: &ProposalStatus,
+) -> Map<Address, bool> {
+    bump_active_entry(env, &DataKey::ProposalApprovalIdx(proposal_id), status);
     env.storage()
         .persistent()
         .get(&DataKey::ProposalApprovalIdx(proposal_id))
         .unwrap_or_else(|| Map::new(env))
 }
 
-fn save_approval_index(env: &Env, proposal_id: u32, index: &Map<Address, bool>) {
+fn save_approval_index(
+    env: &Env,
+    proposal_id: u32,
+    index: &Map<Address, bool>,
+    status: &ProposalStatus,
+) {
     env.storage()
         .persistent()
         .set(&DataKey::ProposalApprovalIdx(proposal_id), index);
-    bump_approval_index(env, proposal_id);
+    bump_active_entry(env, &DataKey::ProposalApprovalIdx(proposal_id), status);
 }
 
 fn get_admin(env: &Env) -> Result<Address, GovernanceError> {
@@ -666,16 +878,24 @@ fn load_proposal(env: &Env, id: u32) -> Result<Proposal, GovernanceError> {
         .persistent()
         .get(&DataKey::Proposal(id))
         .ok_or(GovernanceError::ProposalNotFound)?;
-    bump_proposal(env, id);
-    bump_approval_index(env, id);
+    bump_proposal_retention(env, id, &proposal.status);
     Ok(proposal)
 }
 
+/// Persist a proposal and apply the #52 retention policy for its new state.
+///
+/// When the write moves a proposal into a terminal state, the one-shot archival
+/// floor is granted here as well as the skip in [`bump_proposal_retention`] —
+/// this is the moment the proposal stops needing to be kept alive, and the last
+/// moment the contract is willing to pay for its storage.
 fn save_proposal(env: &Env, id: u32, proposal: &Proposal) {
     env.storage()
         .persistent()
         .set(&DataKey::Proposal(id), proposal);
-    bump_proposal(env, id);
+    if is_terminal(&proposal.status) {
+        seal_terminal_proposal(env, id);
+    }
+    bump_proposal_retention(env, id, &proposal.status);
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,7 +1240,12 @@ impl FluxoraGovernance {
     /// # Parameters
     /// - `proposer`: The co-signer submitting the proposal.
     /// - `target`: The contract address to call when the proposal is executed.
-    /// - `calldata`: Opaque bytes encoding the intended operation (stored for audit).
+    ///   Ignored when `calldata` is a [`CallData::Batch`], where every entry
+    ///   carries its own target; it is still stored for the audit trail.
+    /// - `calldata`: Opaque bytes encoding the intended operation (stored for
+    ///   audit). Either a single-operation [`CallData`] variant or a
+    ///   [`CallData::Batch`] of up to [`MAX_BATCH_CALLS`] operations applied in
+    ///   order, all-or-nothing (#51).
     ///
     /// # Returns
     /// - The proposal ID assigned to the new proposal (monotonically increasing u32).
@@ -1129,7 +1354,10 @@ impl FluxoraGovernance {
         }
 
         // O(1) duplicate-approval check via per-proposal Map index.
-        let mut approval_idx = get_approval_index(&env, proposal_id);
+        // The proposal was already loaded, and the guards above reject every
+        // terminal state, so it is active here and the #52 policy keeps its
+        // storage alive for the rest of the voting window.
+        let mut approval_idx = get_approval_index(&env, proposal_id, &proposal.status);
         if approval_idx.contains_key(approver.clone()) {
             return Err(GovernanceError::AlreadyApproved);
         }
@@ -1161,8 +1389,7 @@ impl FluxoraGovernance {
         };
 
         save_proposal(&env, proposal_id, &proposal);
-        save_approval_index(&env, proposal_id, &approval_idx);
-        bump_approval_index(&env, proposal_id);
+        save_approval_index(&env, proposal_id, &approval_idx, &proposal.status);
         bump_instance(&env);
 
         env.events().publish(
@@ -1186,12 +1413,14 @@ impl FluxoraGovernance {
             env.storage()
                 .persistent()
                 .set(&DataKey::QuorumReachedAt(proposal_id), &info);
-            env.storage().persistent().extend_ttl(
+            // The proposal was just queued, so it is active: the #52 policy
+            // carries the snapshot past the timelock *and* the grace window,
+            // which is what `execute` needs from it.
+            bump_active_entry(
+                &env,
                 &DataKey::QuorumReachedAt(proposal_id),
-                PERSISTENT_LIFETIME_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
+                &proposal.status,
             );
-            bump_quorum_ttl(&env, proposal_id);
 
             env.events().publish(
                 (symbol_short!("proposal_queued"), proposal_id),
@@ -1236,6 +1465,19 @@ impl FluxoraGovernance {
     /// 2. Non-reentrancy guard: the `Executing` in-flight flag rejects *any*
     ///    reentrant `execute` — including for a different proposal — while a
     ///    dispatch is in progress.
+    ///
+    /// # Failure recovery (#53)
+    ///
+    /// If the dispatched call fails, the whole transaction fails and the host
+    /// unwinds it. The proposal is therefore left `Queued` with
+    /// `executed == false`, the target is untouched, no `proposal_executed` is
+    /// emitted, and the `Executing` flag is cleared — all of which happen
+    /// because those writes are part of the same transaction as the target call.
+    ///
+    /// The practical effect is that a transient downstream failure is retryable:
+    /// the proposal stays executable for the remainder of its grace window. A
+    /// failure that never clears expires with that window, returning
+    /// `ProposalExpired`. See `docs/governance-failure-recovery.md`.
     pub fn execute(env: Env, executor: Address, proposal_id: u32) -> Result<(), GovernanceError> {
         executor.require_auth();
 
@@ -1285,7 +1527,13 @@ impl FluxoraGovernance {
             .persistent()
             .get(&DataKey::QuorumReachedAt(proposal_id))
             .ok_or(GovernanceError::QuorumNotReached)?;
-        bump_quorum_ttl(&env, proposal_id);
+        // Still `Queued` at this point, so the #52 policy keeps the snapshot
+        // alive across the dispatch below.
+        bump_active_entry(
+            &env,
+            &DataKey::QuorumReachedAt(proposal_id),
+            &proposal.status,
+        );
 
         if proposal.approval_weight < quorum_info.threshold as u64 {
             return Err(GovernanceError::QuorumNotReached);
@@ -1608,17 +1856,21 @@ impl FluxoraGovernance {
     ///   or proposal does not exist).
     ///
     /// This is a pure read — no authorization required, no state mutation
-    /// other than the standard TTL bump on the stored `QuorumInfo` entry.
+    /// other than the TTL bump applied by the #52 retention policy to the
+    /// stored `QuorumInfo` entry (skipped once the proposal is terminal).
     pub fn get_quorum_info(env: Env, proposal_id: u32) -> Option<QuorumInfo> {
         let info: Option<QuorumInfo> = env
             .storage()
             .persistent()
             .get(&DataKey::QuorumReachedAt(proposal_id));
-        if info.is_some() {
-            env.storage().persistent().extend_ttl(
+        // A view must not keep a finished proposal's storage alive, so the bump
+        // is conditional on the proposal still being active. The status lookup
+        // is a single O(1) read of a key we would not otherwise touch here.
+        if info.is_some() && !proposal_is_terminal(&env, proposal_id) {
+            bump_active_entry(
+                &env,
                 &DataKey::QuorumReachedAt(proposal_id),
-                PERSISTENT_LIFETIME_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
+                &ProposalStatus::Queued,
             );
         }
         info
@@ -1671,11 +1923,13 @@ impl FluxoraGovernance {
             .persistent()
             .get(&DataKey::QuorumReachedAt(proposal_id))
         {
+            // `Queued` is the only status that reaches this point, so the #52
+            // policy keeps the snapshot alive for this read.
             Some(info) => {
-                env.storage().persistent().extend_ttl(
+                bump_active_entry(
+                    &env,
                     &DataKey::QuorumReachedAt(proposal_id),
-                    PERSISTENT_LIFETIME_THRESHOLD,
-                    PERSISTENT_BUMP_AMOUNT,
+                    &proposal.status,
                 );
                 info
             }
@@ -1814,7 +2068,10 @@ impl FluxoraGovernance {
                 .persistent()
                 .get::<DataKey, Proposal>(&DataKey::Proposal(current))
             {
-                bump_proposal(&env, current);
+                // Paging is a bulk read, so it is exactly the kind of call that
+                // would otherwise hold every historical proposal alive forever.
+                // The #52 policy bumps only the active ones.
+                bump_active_entry(&env, &DataKey::Proposal(current), &proposal.status);
                 result.push_back(proposal);
             }
             current += 1;
@@ -4139,6 +4396,184 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Batch proposals (issue #51)
+    //
+    // A `CallData::Batch` payload carries up to MAX_BATCH_CALLS
+    // `ExecutionCall`s, each with its own target, and `execute` applies them in
+    // order. The property that matters is all-or-nothing: if any entry fails,
+    // the host unwinds the whole transaction, so the entries that already ran
+    // leave no trace and the proposal stays executable.
+    //
+    // The mocks below make that observable. `BatchTarget` records the order in
+    // which governance applied its setters, `FlakyTarget` can be told to start
+    // failing to model a transient downstream lock, and both require the
+    // governance contract's authorization, so no state changes except through
+    // `execute`.
+    //
+    // The write-up is docs/governance-batch-proposals.md.
+    // -----------------------------------------------------------------------
+
+    /// Storage keys for [`BatchTarget`].
+    #[contracttype]
+    #[derive(Clone, Debug)]
+    pub enum BatchTargetKey {
+        /// The only address permitted to mutate this mock.
+        Controller,
+        /// Deposit cap, written by `set_cap`.
+        Cap,
+        /// Minimum duration, written by `set_min_duration`.
+        MinDuration,
+        /// Allowlist flag, written by `set_allowlist`.
+        Allowed,
+        /// Order in which the governed setters were applied.
+        Applied,
+    }
+
+    /// Op codes recorded in [`BatchTargetKey::Applied`].
+    const OP_SET_CAP: u32 = 1;
+    const OP_SET_MIN_DURATION: u32 = 2;
+    const OP_SET_ALLOWLIST: u32 = 3;
+
+    /// Governed stand-in whose three setters are reachable through
+    /// `FactorySetCap`, `FactorySetMinDuration` and `FactorySetAllowlist`.
+    #[contract]
+    pub struct BatchTarget;
+
+    #[contractimpl]
+    impl BatchTarget {
+        pub fn init(env: Env, controller: Address) {
+            env.storage()
+                .instance()
+                .set(&BatchTargetKey::Controller, &controller);
+            env.storage().instance().set(&BatchTargetKey::Cap, &0i128);
+            env.storage()
+                .instance()
+                .set(&BatchTargetKey::MinDuration, &0u64);
+            env.storage()
+                .instance()
+                .set(&BatchTargetKey::Allowed, &false);
+            env.storage()
+                .instance()
+                .set(&BatchTargetKey::Applied, &Vec::new(&env));
+        }
+
+        pub fn set_cap(env: Env, cap: i128) {
+            controller_of(&env, &BatchTargetKey::Controller).require_auth();
+            env.storage().instance().set(&BatchTargetKey::Cap, &cap);
+            record_applied(&env, OP_SET_CAP);
+        }
+
+        pub fn set_min_duration(env: Env, min_duration: u64) {
+            controller_of(&env, &BatchTargetKey::Controller).require_auth();
+            env.storage()
+                .instance()
+                .set(&BatchTargetKey::MinDuration, &min_duration);
+            record_applied(&env, OP_SET_MIN_DURATION);
+        }
+
+        pub fn set_allowlist(env: Env, _recipient: Address, allowed: bool) {
+            controller_of(&env, &BatchTargetKey::Controller).require_auth();
+            env.storage()
+                .instance()
+                .set(&BatchTargetKey::Allowed, &allowed);
+            record_applied(&env, OP_SET_ALLOWLIST);
+        }
+
+        /// The ordered log of setters governance has applied.
+        pub fn applied(env: Env) -> Vec<u32> {
+            env.storage()
+                .instance()
+                .get(&BatchTargetKey::Applied)
+                .unwrap_or_else(|| Vec::new(&env))
+        }
+
+        pub fn cap(env: Env) -> i128 {
+            env.storage()
+                .instance()
+                .get(&BatchTargetKey::Cap)
+                .unwrap_or(0)
+        }
+
+        pub fn min_duration(env: Env) -> u64 {
+            env.storage()
+                .instance()
+                .get(&BatchTargetKey::MinDuration)
+                .unwrap_or(0)
+        }
+
+        pub fn allowed(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&BatchTargetKey::Allowed)
+                .unwrap_or(false)
+        }
+    }
+
+    /// Read the controller recorded under `key` for one of the batch mocks.
+    fn controller_of(env: &Env, key: &BatchTargetKey) -> Address {
+        env.storage()
+            .instance()
+            .get(key)
+            .expect("controller set by init")
+    }
+
+    /// Append an op code to the mock's ordered log.
+    fn record_applied(env: &Env, op: u32) {
+        let mut log: Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&BatchTargetKey::Applied)
+            .expect("log initialised by init");
+        log.push_back(op);
+        env.storage().instance().set(&BatchTargetKey::Applied, &log);
+    }
+
+    /// Storage keys for [`FlakyTarget`].
+    #[contracttype]
+    #[derive(Clone, Debug)]
+    pub enum FlakyTargetKey {
+        /// The only address permitted to mutate this mock.
+        Controller,
+        /// When true, `set_cap` traps instead of applying.
+        Failing,
+        /// Value written by `set_cap` when the target is healthy.
+        Cap,
+    }
+
+    /// Governed stand-in that can be switched into a failing state, to model a
+    /// transient downstream lock during `execute` (#51 atomicity, #53 recovery).
+    #[contract]
+    pub struct FlakyTarget;
+
+    #[contractimpl]
+    impl FlakyTarget {
+        pub fn init(env: Env, controller: Address) {
+            env.storage()
+                .instance()
+                .set(&FlakyTargetKey::Controller, &controller);
+            env.storage()
+                .instance()
+                .set(&FlakyTargetKey::Failing, &false);
+            env.storage().instance().set(&FlakyTargetKey::Cap, &0i128);
+        }
+
+        /// Toggle the simulated downstream failure. Callable by anyone: it is
+        /// the test fixture's own switch, not governed state.
+        pub fn set_failing(env: Env, failing: bool) {
+            env.storage()
+                .instance()
+                .set(&FlakyTargetKey::Failing, &failing);
+        }
+
+        pub fn is_failing(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&FlakyTargetKey::Failing)
+                .unwrap_or(false)
+        }
+
+        /// Traps while the target is failing, so governance's dispatch panics
+        /// and the host unwinds the entire transaction.
     // Timelock bypass audit (issue #50)
     //
     // Two layers:
@@ -4412,6 +4847,92 @@ mod tests {
             let controller: Address = env
                 .storage()
                 .instance()
+                .get(&FlakyTargetKey::Controller)
+                .expect("controller set by init");
+            controller.require_auth();
+            if env
+                .storage()
+                .instance()
+                .get(&FlakyTargetKey::Failing)
+                .unwrap_or(false)
+            {
+                panic!("downstream state locked");
+            }
+            env.storage().instance().set(&FlakyTargetKey::Cap, &cap);
+        }
+
+        pub fn cap(env: Env) -> i128 {
+            env.storage()
+                .instance()
+                .get(&FlakyTargetKey::Cap)
+                .unwrap_or(0)
+        }
+    }
+
+    /// XDR-encode any `CallData` payload.
+    fn op_calldata(env: &Env, op: CallData) -> Bytes {
+        use soroban_sdk::xdr::ToXdr;
+        op.to_xdr(env)
+    }
+
+    /// XDR-encode a batch payload of `calls`, in order.
+    ///
+    /// Takes the `Vec` by value: it becomes the `CallData::Batch` payload
+    /// verbatim, so the test module hands over exactly the entries it built
+    /// with the `vec!` macro.
+    fn batch_calldata(env: &Env, calls: Vec<ExecutionCall>) -> Bytes {
+        op_calldata(env, CallData::Batch(calls))
+    }
+
+    /// `count` entries that each apply `FactorySetCap(3)` to `target`.
+    fn cap_entries(env: &Env, target: &Address, count: u32) -> Vec<ExecutionCall> {
+        let mut entries = Vec::new(env);
+        for _ in 0..count {
+            entries.push_back(ExecutionCall {
+                target: target.clone(),
+                calldata: set_cap(env, 3),
+            });
+        }
+        entries
+    }
+
+    /// One entry of a batch: `op` applied to `target`.
+    fn entry(env: &Env, target: &Address, op: CallData) -> ExecutionCall {
+        ExecutionCall {
+            target: target.clone(),
+            calldata: op_calldata(env, op),
+        }
+    }
+
+    /// One entry of a batch with an arbitrary payload — used to build entries
+    /// that must be refused (nested batch, undecodable bytes).
+    fn entry_raw(target: &Address, calldata: Bytes) -> ExecutionCall {
+        ExecutionCall {
+            target: target.clone(),
+            calldata,
+        }
+    }
+
+    /// XDR-encode `FactorySetCap(cap)`.
+    fn set_cap(env: &Env, cap: i128) -> Bytes {
+        op_calldata(env, CallData::FactorySetCap(cap))
+    }
+
+    fn deploy_batch_target(ctx: &Ctx) -> Address {
+        let target = ctx.env.register(BatchTarget, ());
+        BatchTargetClient::new(&ctx.env, &target).init(&ctx.contract_id);
+        target
+    }
+
+    fn deploy_flaky_target(ctx: &Ctx) -> Address {
+        let target = ctx.env.register(FlakyTarget, ());
+        FlakyTargetClient::new(&ctx.env, &target).init(&ctx.contract_id);
+        target
+    }
+
+    /// Queue a proposal for `calldata` and advance past the timelock.
+    fn queued(ctx: &Ctx, target: &Address, calldata: &Bytes) -> u32 {
+        let id = ctx.client.propose(&ctx.signer_a, target, calldata);
                 .get(&MockTargetKey::Controller)
                 .expect("controller set");
             controller.require_auth();
@@ -4480,6 +5001,319 @@ mod tests {
         id
     }
 
+    /// The control case: a single operation still dispatches unchanged.
+    #[test]
+    fn test_single_call_proposal_still_dispatches() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let client = BatchTargetClient::new(&ctx.env, &target);
+        let id = queued(&ctx, &target, &set_cap(&ctx.env, 42));
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        ctx.client.execute(&Address::generate(&ctx.env), &id);
+
+        assert_eq!(client.cap(), 42);
+        assert_eq!(client.applied(), vec![&ctx.env, OP_SET_CAP]);
+    }
+
+    /// Every entry of a batch is applied, in the order it was written.
+    #[test]
+    fn test_batch_applies_every_call_in_order() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let client = BatchTargetClient::new(&ctx.env, &target);
+        let recipient = Address::generate(&ctx.env);
+        let calls = vec![
+            entry(&ctx.env, &target, CallData::FactorySetCap(500)),
+            entry(
+                &ctx.env,
+                &target,
+                CallData::FactorySetMinDuration(1_209_600),
+            ),
+            entry(
+                &ctx.env,
+                &target,
+                CallData::FactorySetAllowlist(recipient, true),
+            ),
+            // A `Noop` entry is a legal no-op and must not disturb the others.
+            entry(&ctx.env, &target, CallData::Noop),
+        ];
+        let calldata = batch_calldata(&ctx.env, calls);
+        let id = queued(&ctx, &target, &calldata);
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        ctx.client.execute(&Address::generate(&ctx.env), &id);
+
+        assert_eq!(client.cap(), 500);
+        assert_eq!(client.min_duration(), 1_209_600);
+        assert!(client.allowed());
+        assert_eq!(
+            client.applied(),
+            vec![&ctx.env, OP_SET_CAP, OP_SET_MIN_DURATION, OP_SET_ALLOWLIST]
+        );
+        assert!(ctx.client.get_proposal(&id).executed);
+    }
+
+    /// One proposal, two targets: each entry carries its own address, so a
+    /// policy update that spans contracts needs a single timelock cycle.
+    #[test]
+    fn test_batch_spans_multiple_targets() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let flaky = deploy_flaky_target(&ctx);
+        let target_client = BatchTargetClient::new(&ctx.env, &target);
+        let flaky_client = FlakyTargetClient::new(&ctx.env, &flaky);
+
+        let calls = vec![
+            entry(&ctx.env, &target, CallData::FactorySetCap(7)),
+            entry(&ctx.env, &flaky, CallData::FactorySetCap(9)),
+        ];
+        let calldata = batch_calldata(&ctx.env, calls);
+        let id = queued(&ctx, &target, &calldata);
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        ctx.client.execute(&Address::generate(&ctx.env), &id);
+
+        assert_eq!(target_client.cap(), 7);
+        assert_eq!(flaky_client.cap(), 9);
+        assert!(ctx.client.get_proposal(&id).executed);
+    }
+
+    /// The atomicity property: a failing entry unwinds the entries before it.
+    ///
+    /// `set_cap` on the healthy target runs first and succeeds; the second
+    /// entry traps. After the failed execution the healthy target must still
+    /// read zero, the proposal must not be marked executed, no
+    /// `proposal_executed` event may exist, and the proposal must still be
+    /// executable.
+    #[test]
+    fn test_batch_reverts_every_call_when_one_fails() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let flaky = deploy_flaky_target(&ctx);
+        let target_client = BatchTargetClient::new(&ctx.env, &target);
+        let flaky_client = FlakyTargetClient::new(&ctx.env, &flaky);
+        flaky_client.set_failing(&true);
+
+        let calls = vec![
+            entry(&ctx.env, &target, CallData::FactorySetCap(7)),
+            entry(&ctx.env, &flaky, CallData::FactorySetCap(9)),
+        ];
+        let calldata = batch_calldata(&ctx.env, calls);
+        let id = queued(&ctx, &target, &calldata);
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        let executor = Address::generate(&ctx.env);
+        assert!(
+            ctx.client.try_execute(&executor, &id).is_err(),
+            "a trapping sub-call must fail the whole execution"
+        );
+
+        // The first entry's write is gone, not merely the second's.
+        assert_eq!(target_client.cap(), 0);
+        assert!(target_client.applied().is_empty());
+        assert_eq!(flaky_client.cap(), 0);
+        assert!(!ctx.client.get_proposal(&id).executed);
+        assert_eq!(executed_event_count(&ctx.env, &ctx.contract_id), 0);
+        // Still executable: a transient failure is retryable (#53).
+        assert!(ctx.client.is_executable(&id));
+    }
+
+    /// A transient failure is retryable: once the downstream lock clears, the
+    /// same proposal executes and every entry lands exactly once.
+    #[test]
+    fn test_batch_is_retryable_after_a_transient_failure() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let flaky = deploy_flaky_target(&ctx);
+        let target_client = BatchTargetClient::new(&ctx.env, &target);
+        let flaky_client = FlakyTargetClient::new(&ctx.env, &flaky);
+
+        let calls = vec![
+            entry(&ctx.env, &target, CallData::FactorySetCap(7)),
+            entry(&ctx.env, &flaky, CallData::FactorySetCap(9)),
+        ];
+        let calldata = batch_calldata(&ctx.env, calls);
+        let id = queued(&ctx, &target, &calldata);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        let executor = Address::generate(&ctx.env);
+
+        flaky_client.set_failing(&true);
+        assert!(ctx.client.try_execute(&executor, &id).is_err());
+        assert_eq!(target_client.cap(), 0);
+
+        flaky_client.set_failing(&false);
+        ctx.client.execute(&executor, &id);
+
+        assert_eq!(target_client.cap(), 7);
+        assert_eq!(flaky_client.cap(), 9);
+        assert_eq!(target_client.applied(), vec![&ctx.env, OP_SET_CAP]);
+        assert!(ctx.client.get_proposal(&id).executed);
+        assert_eq!(executed_event_count(&ctx.env, &ctx.contract_id), 1);
+
+        // A second execution cannot replay the batch.
+        assert_eq!(
+            ctx.client.try_execute(&executor, &id),
+            Err(Ok(GovernanceError::AlreadyExecuted))
+        );
+        assert_eq!(target_client.applied(), vec![&ctx.env, OP_SET_CAP]);
+    }
+
+    /// Batching does not weaken the timelock: the whole batch waits for the eta.
+    #[test]
+    fn test_batch_still_respects_the_timelock() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let client = BatchTargetClient::new(&ctx.env, &target);
+        let calls = vec![
+            entry(&ctx.env, &target, CallData::FactorySetCap(7)),
+            entry(
+                &ctx.env,
+                &target,
+                CallData::FactorySetMinDuration(1_209_600),
+            ),
+        ];
+        let calldata = batch_calldata(&ctx.env, calls);
+        let id = queued(&ctx, &target, &calldata);
+
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &id),
+            Err(Ok(GovernanceError::TimelockNotMet))
+        );
+        assert_eq!(client.cap(), 0);
+        assert!(client.applied().is_empty());
+    }
+
+    #[test]
+    fn test_empty_batch_is_rejected() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let calldata = batch_calldata(&ctx.env, Vec::new(&ctx.env));
+        let id = queued(&ctx, &target, &calldata);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &id),
+            Err(Ok(GovernanceError::InvalidCalldata))
+        );
+        assert!(BatchTargetClient::new(&ctx.env, &target)
+            .applied()
+            .is_empty());
+    }
+
+    /// The bound is inclusive: exactly `MAX_BATCH_CALLS` entries execute, and
+    /// one more is refused before any target is reached.
+    #[test]
+    fn test_batch_is_bounded_by_max_batch_calls() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let client = BatchTargetClient::new(&ctx.env, &target);
+        let executor = Address::generate(&ctx.env);
+
+        let too_big = batch_calldata(
+            &ctx.env,
+            cap_entries(&ctx.env, &target, MAX_BATCH_CALLS + 1),
+        );
+        let big_id = queued(&ctx, &target, &too_big);
+        let at_limit = batch_calldata(&ctx.env, cap_entries(&ctx.env, &target, MAX_BATCH_CALLS));
+        let ok_id = queued(&ctx, &target, &at_limit);
+
+        // Both proposals are queued at the same instant, so one clock advance
+        // past the timelock makes them executable.
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+
+        assert_eq!(
+            ctx.client.try_execute(&executor, &big_id),
+            Err(Ok(GovernanceError::BatchTooLarge))
+        );
+        assert!(
+            client.applied().is_empty(),
+            "an over-limit batch must be refused before the first target call"
+        );
+
+        ctx.client.execute(&executor, &ok_id);
+
+        assert_eq!(client.cap(), 3);
+        assert_eq!(client.applied().len(), MAX_BATCH_CALLS);
+        assert!(ctx.client.get_proposal(&ok_id).executed);
+    }
+
+    /// The cost envelope, measured where it can be measured without a network:
+    /// a worst-case batch payload stays inside `MAX_CALLDATA_BYTES`, so the
+    /// entry bound can never be widened by relaxing the calldata limit.
+    #[test]
+    fn test_max_batch_payload_fits_within_max_calldata_bytes() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        // Largest inner payload governance can dispatch: a 32-byte wasm hash.
+        let worst = entry(
+            &ctx.env,
+            &target,
+            CallData::FactorySetStreamWasmHash(BytesN::from_array(&ctx.env, &[0x11; 32])),
+        );
+        let entries = vec![
+            &ctx.env,
+            worst.clone(),
+            worst.clone(),
+            worst.clone(),
+            worst.clone(),
+            worst,
+        ];
+        let payload = batch_calldata(&ctx.env, entries);
+
+        assert!(
+            payload.len() <= MAX_CALLDATA_BYTES,
+            "a {}-call batch of the largest operation encodes to {} bytes, over the {}-byte limit",
+            MAX_BATCH_CALLS,
+            payload.len(),
+            MAX_CALLDATA_BYTES
+        );
+    }
+
+    /// Batches do not nest, so `MAX_BATCH_CALLS` cannot be side-stepped by
+    /// hiding calls one level down.
+    #[test]
+    fn test_nested_batch_is_rejected() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let inner = batch_calldata(&ctx.env, cap_entries(&ctx.env, &target, 1));
+        let calldata = batch_calldata(&ctx.env, vec![&ctx.env, entry_raw(&target, inner)]);
+        let id = queued(&ctx, &target, &calldata);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &id),
+            Err(Ok(GovernanceError::InvalidCalldata))
+        );
+        assert_eq!(BatchTargetClient::new(&ctx.env, &target).cap(), 0);
+    }
+
+    /// An entry whose payload is not a decodable `CallData` fails the batch
+    /// before any target is reached.
+    #[test]
+    fn test_batch_entry_with_undecodable_calldata_is_rejected() {
+        let ctx = Ctx::setup();
+        let target = deploy_batch_target(&ctx);
+        let junk = Bytes::from_slice(&ctx.env, &[0xff, 0x00, 0x01]);
+        let calldata = batch_calldata(
+            &ctx.env,
+            vec![
+                &ctx.env,
+                entry(&ctx.env, &target, CallData::FactorySetCap(7)),
+                entry_raw(&target, junk),
+            ],
+        );
+        let id = queued(&ctx, &target, &calldata);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &id),
+            Err(Ok(GovernanceError::InvalidCalldata))
+        );
+        assert_eq!(BatchTargetClient::new(&ctx.env, &target).cap(), 0);
+        assert!(BatchTargetClient::new(&ctx.env, &target)
+            .applied()
+            .is_empty());
     /// Plausible backdoor entrypoint names — none of them may exist.
     #[test]
     fn test_no_backdoor_entrypoint_is_reachable() {

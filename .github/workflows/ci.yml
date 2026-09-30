@@ -68,7 +68,15 @@ jobs:
         run: pytest tests/ --cov=script/ --cov-fail-under=50 -v --tb=short
 
       - name: Validate doc alignment (streaming / events / errors)
-        run: echo "Skip missing python script"
+        run: python3 script/validate-doc-alignment.py
+
+      # Hard gate: docs/ABI.md is the frozen interface of record. This
+      # re-derives every #[contractevent] topic/payload layout from
+      # events.rs and fails (exit 1) on any drift, plus checks that the
+      # document still declares itself frozen. Unlike the step above, this
+      # one is fatal by design - a checker that only warns is not a check.
+      - name: ABI drift gate (docs/ABI.md vs events.rs)
+        run: python3 script/abi-drift-check.py
 
       # Hard gate: diff the #[contractimpl] pub fn surface against
       # docs/audit.md's entrypoint table.  Fails (exit 1) if any ABI

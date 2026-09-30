@@ -41,6 +41,38 @@ So the freeze is a commitment about how we manage that:
 Consumers should pin the wasm hash above and treat a change in it as requiring
 a review of this document.
 
+### How to change the interface
+
+The freeze is only meaningful if it is mechanically enforced, so the event
+table in this document is checked against `events.rs` on every pull request by
+[`script/abi-drift-check.py`](../script/abi-drift-check.py). It exits non-zero
+when any of the following is true, so a change cannot land by editing one side
+and forgetting the other:
+
+* an event's **topic order** changed, or a field gained or lost `#[topic]`;
+* an event's **payload order** changed, or a payload field was removed;
+* an event exists in `events.rs` but has no row here, or has a row here but no
+  struct in `events.rs`;
+* a `pub const` quoted in this document disagrees with `lib.rs`;
+* this document stopped declaring itself frozen.
+
+**Versioning rule for contributors:**
+
+1. Make the source change in `contracts/stream/src/events.rs`.
+2. Update the matching row in the `## Events` table **in the same commit**.
+3. If the change is breaking (per the list above), bump `ABI_VERSION`, update
+   the wasm hash and spec sha256 fields at the top of this file once the new
+   build exists, and add a migration note to [MIGRATION.md](MIGRATION.md).
+4. If the change is additive, no version bump is needed — append new fields at
+   the *end* of the payload and note it in the PR description so downstream
+   indexers know to tolerate unknown trailing fields.
+
+The checker is a fast static pre-flight: it reads the source, it does not
+compile. The authoritative check remains comparing the compiled wasm's
+interface XDR against this document, which is a release-time step. This
+catches the common failure — a reordered `#[topic]` or an undocumented event —
+in seconds rather than at deployment.
+
 **Generate, do not hand-write.** Event and function schemas are embedded in the
 deployed contract via `#[contractevent]` and `#[contractimpl]`. The SDK and
 indexer must codegen from `stellar contract info interface`, not from
@@ -184,52 +216,16 @@ is derived from the *event* budget rather than the entry count.
 
 ## Events
 
-Declared with `#[contractevent]`; schemas are in the deployed spec. Every event's
-topic vector is `[symbol, stream_id, ...]` where `symbol` is the snake_case
-struct name, followed by zero or more routing topics in the order shown.
+Declared with `#[contractevent]`; schemas are in the deployed spec. `topic[0]`
+is the snake_case event name, and `topic[1]` is always `stream_id`. The two
+remaining topic slots are the routing fields an indexer filters on, ordered
+party-before-counterparty so that a consumer can key on either without
+decoding the payload.
 
-### Topic positions
-
-Positions are absolute, so an indexer can address a topic by index without
-decoding the payload. `—` means the event has no topic at that index.
-
-| event | topic[0] | topic[1] | topic[2] | topic[3] |
-|---|---|---|---|---|
-| `stream_created` | `stream_created` | `stream_id` | `sender` | `recipient` |
-| `withdrawn` | `withdrawn` | `stream_id` | `recipient` | — |
-| `cancelled` | `cancelled` | `stream_id` | `sender` | `recipient` |
-| `paused` | `paused` | `stream_id` | `sender` | — |
-| `resumed` | `resumed` | `stream_id` | `sender` | — |
-| `topped_up` | `topped_up` | `stream_id` | `sender` | — |
-| `recipient_transferred` | `recipient_transferred` | `stream_id` | `old_recipient` | `new_recipient` |
-| `delegate_granted` | `delegate_granted` | `stream_id` | `grantor` | `delegate` |
-| `delegate_revoked` | `delegate_revoked` | `stream_id` | `grantor` | `delegate` |
-| `ttl_extended` | `ttl_extended` | `stream_id` | — | — |
-
-`topic[1]` is `stream_id` for **all ten** events without exception, which is
-what makes a single "all events for stream N" filter possible. Topic arity
-varies from 2 to 4 depending on how many parties the event routes on, so a
-consumer must not assume four topics.
-
-### Ordering rule
-
-Topics are ordered by *role*, not by a fixed global pattern:
-
-1. `stream_id` — always first, because it is the only universal join key.
-2. The **initiating party** (`sender`, `grantor`).
-3. The **counterparty**, when the event describes a relationship rather than a
-   unilateral action (`recipient`, `delegate`, `new_recipient`).
-
-Events that only one party acts on (`paused`, `resumed`, `topped_up`) stop
-after topic[2]. `ttl_extended` is a keeper maintenance event with no party in
-it at all, so it carries `stream_id` alone.
-
-`recipient_transferred` is deliberately `old_recipient` then `new_recipient`:
-an indexer filtering "streams where X is the new recipient" must be able to
-target topic[3] without also matching every stream where X is the old one.
-Reversing those two would silently break that filter.
-
-### Payloads
+The table below is the authoritative topic layout. It is checked against
+`events.rs` by [`script/abi-drift-check.py`](../script/abi-drift-check.py) on
+every pull request; changing a row here without changing the struct (or the
+reverse) fails CI.
 
 | event | topics after the name | payload |
 |---|---|---|
@@ -249,8 +245,8 @@ initial state. It is the only source of the per-stream metadata needed to build
 a sender/recipient mapping before any later lifecycle event arrives.
 
 `recipient_transferred` and `delegate_revoked` carry an empty payload: every
-field they route on is already a topic, so there is nothing left to put in the
-data slot.
+field they need to route on is already a topic, so there is nothing left to
+put in the data slot.
 
 Every payload carries enough state to reconstruct the stream without replaying
 from genesis. Field order and topic placement are ABI.
