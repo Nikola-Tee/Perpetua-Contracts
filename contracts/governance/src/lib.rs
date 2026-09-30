@@ -1465,6 +1465,19 @@ impl FluxoraGovernance {
     /// 2. Non-reentrancy guard: the `Executing` in-flight flag rejects *any*
     ///    reentrant `execute` — including for a different proposal — while a
     ///    dispatch is in progress.
+    ///
+    /// # Failure recovery (#53)
+    ///
+    /// If the dispatched call fails, the whole transaction fails and the host
+    /// unwinds it. The proposal is therefore left `Queued` with
+    /// `executed == false`, the target is untouched, no `proposal_executed` is
+    /// emitted, and the `Executing` flag is cleared — all of which happen
+    /// because those writes are part of the same transaction as the target call.
+    ///
+    /// The practical effect is that a transient downstream failure is retryable:
+    /// the proposal stays executable for the remainder of its grace window. A
+    /// failure that never clears expires with that window, returning
+    /// `ProposalExpired`. See `docs/governance-failure-recovery.md`.
     pub fn execute(env: Env, executor: Address, proposal_id: u32) -> Result<(), GovernanceError> {
         executor.require_auth();
 
