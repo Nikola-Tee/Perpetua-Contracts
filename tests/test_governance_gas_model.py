@@ -1,0 +1,390 @@
+"""tests/test_governance_gas_model.py
+
+Tests for script/governance-gas-model.py, the static cost model behind issue
+#54.
+
+The model does not measure CPU instructions - that needs a host run. What it
+does is count the storage/ledger/event operations each governance entrypoint
+performs, and assert the structural properties that keep per-vote cost
+independent of the signer count.
+
+The negative cases matter most here. A structural check that cannot fail is
+the same failure mode this script exists to avoid (see
+script/validate-doc-alignment.py, whose every check returns True), so each
+check is exercised against a deliberately regressed copy of the source and
+must report the problem.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+_ROOT = Path(__file__).resolve().parent.parent
+_SCRIPT = _ROOT / "script" / "governance-gas-model.py"
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("governance_gas_model", _SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ggm = _load_module()
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+
+class TestStripComments:
+    def test_line_comment_removed(self):
+        assert ggm.strip_comments("let x = 1; // note").strip() == "let x = 1;"
+
+    def test_block_comment_removed(self):
+        src = "let a = 1;\n/* hides\n   { ( stuff\n*/\nlet b = 2;"
+        out = ggm.strip_comments(src)
+        assert "hides" not in out
+        assert "let b = 2;" in out
+
+    def test_double_slash_in_string_preserved(self):
+        assert 'let u = "http://x";' in ggm.strip_comments('let u = "http://x";')
+
+
+class TestExtractFunction:
+    SOURCE = """
+fn helper(env: &Env) -> u32 {
+    env.ledger().timestamp()
+}
+
+fn caller(env: Env) -> Result<(), Error> {
+    helper(&env);
+    Ok(())
+}
+"""
+
+    def test_method_with_return_type(self):
+        assert "helper(&env)" in ggm.extract_function(self.SOURCE, "caller")
+
+    def test_free_function(self):
+        assert "timestamp" in ggm.extract_function(self.SOURCE, "helper")
+
+    def test_unknown_function_raises(self):
+        with pytest.raises(ggm.ParseError):
+            ggm.extract_function(self.SOURCE, "does_not_exist")
+
+
+# ---------------------------------------------------------------------------
+# Operation counting
+# ---------------------------------------------------------------------------
+
+
+class TestCountOps:
+    def test_counts_each_leaf_kind(self):
+        body = """
+        env.storage().instance().get::<DataKey, u32>(&DataKey::A);
+        env.storage().persistent().set(&DataKey::B, &1u32);
+        env.storage().persistent().extend_ttl(&DataKey::B, 1, 1);
+        env.ledger().timestamp();
+        env.events().publish((symbol_short!("x"),), 1u32);
+        """
+        counts = ggm.count_ops(body)
+        assert counts["instance_read"] == 1
+        assert counts["persistent_write"] == 1
+        assert counts["persistent_bump"] == 1
+        assert counts["ledger_read"] == 1
+        assert counts["event_emit"] == 1
+
+
+class TestEnclosingIf:
+    def test_inside_if_block(self):
+        assert ggm.enclosing_if("{ if x { f(); } }", "f();")
+
+    def test_inside_if_let_block(self):
+        assert ggm.enclosing_if("{ if let Some(v) = o { g(v); } }", "g(v);")
+
+    def test_outside_if_block(self):
+        assert not ggm.enclosing_if("{ f(); if x { g(); } }", "f();")
+
+    def test_outside_any_block(self):
+        assert not ggm.enclosing_if("f();", "f();")
+
+    def test_nested_inside_if(self):
+        assert ggm.enclosing_if("{ if a { match b { _ => { f(); } } } }", "f();")
+
+
+# ---------------------------------------------------------------------------
+# Structural checks, including the negative cases
+# ---------------------------------------------------------------------------
+
+GOOD = """
+const MAX_SIGNERS: u32 = 20;
+const MAX_CALLDATA_BYTES: u32 = 4_096;
+pub const MAX_PAGE_SIZE: u32 = 100;
+
+fn get_signer_index(env: &Env) -> Map<Address, bool> {
+    env.storage().instance().get(&DataKey::SignerIndex)
+}
+
+fn is_registered_signer(env: &Env, addr: &Address) -> bool {
+    let index = get_signer_index(env);
+    index.contains_key(addr.clone())
+}
+
+fn approve(env: Env, approver: Address, proposal_id: u32) -> Result<(), E> {
+    if !is_registered_signer(&env, &approver) { return Err(E::NotASigner); }
+    let mut idx = get_approval_index(&env, proposal_id);
+    if idx.contains_key(approver.clone()) { return Err(E::AlreadyApproved); }
+    env.storage().persistent().set(&DataKey::P(id), &proposal);
+    if approval_count == threshold {
+        env.storage().persistent().set(&DataKey::QuorumReachedAt(id), &info);
+        env.events().publish((symbol_short!("proposal_queued"), id), info);
+    }
+    Ok(())
+}
+"""
+
+
+def _stripped(text: str) -> str:
+    return ggm.strip_comments(text)
+
+
+class TestVoteCostIsSignerIndependent:
+    def test_good_source_passes(self):
+        assert ggm.check_vote_cost_is_signer_independent(_stripped(GOOD)) == []
+
+    def test_linear_signer_scan_is_caught(self):
+        bad = GOOD.replace(
+            "    let index = get_signer_index(env);\n"
+            "    index.contains_key(addr.clone())",
+            "    let signers: Vec<Address> = env.storage().instance()"
+            ".get(&DataKey::Signers);\n"
+            "    for s in signers.iter() { if s == *addr { return true; } }\n"
+            "    false",
+        )
+        assert bad != GOOD, "fixture replacement did not apply"
+        problems = ggm.check_vote_cost_is_signer_independent(_stripped(bad))
+        assert problems, "a linear scan over Signers must be reported"
+
+    def test_dropping_the_membership_check_is_caught(self):
+        bad = GOOD.replace("if !is_registered_signer(&env, &approver)", "if false")
+        problems = ggm.check_vote_cost_is_signer_independent(_stripped(bad))
+        assert any("is_registered_signer" in p for p in problems)
+
+
+class TestDuplicateApprovalIsO1:
+    def test_good_source_passes(self):
+        assert ggm.check_duplicate_approval_is_o1(_stripped(GOOD)) == []
+
+    def test_approvals_vec_scan_is_caught(self):
+        bad = GOOD.replace(
+            "if idx.contains_key(approver.clone())",
+            "if proposal.approvals.iter().any(|a| a == approver)",
+        )
+        assert bad != GOOD, "fixture replacement did not apply"
+        problems = ggm.check_duplicate_approval_is_o1(_stripped(bad))
+        assert any("approvals Vec" in p for p in problems)
+
+    def test_dropping_the_index_is_caught(self):
+        bad = GOOD.replace("get_approval_index(&env, proposal_id)", "Map::new(&env)")
+        problems = ggm.check_duplicate_approval_is_o1(_stripped(bad))
+        assert any("approval index" in p for p in problems)
+
+
+class TestQuorumBranchIsConditional:
+    def test_good_source_passes(self):
+        assert ggm.check_quorum_branch_is_conditional(_stripped(GOOD)) == []
+
+    def test_unconditional_quorum_write_is_caught(self):
+        bad = GOOD.replace(
+            "    if approval_count == threshold {\n"
+            "        env.storage().persistent().set"
+            "(&DataKey::QuorumReachedAt(id), &info);\n"
+            "        env.events().publish"
+            "((symbol_short!(\"proposal_queued\"), id), info);\n"
+            "    }\n",
+            "    env.storage().persistent().set"
+            "(&DataKey::QuorumReachedAt(id), &info);\n"
+            "    env.events().publish"
+            "((symbol_short!(\"proposal_queued\"), id), info);\n",
+        )
+        assert bad != GOOD, "fixture replacement did not apply"
+        problems = ggm.check_quorum_branch_is_conditional(_stripped(bad))
+        assert any("no longer inside a conditional" in p for p in problems)
+
+    def test_missing_quorum_anchor_is_caught(self):
+        bad = GOOD.replace("QuorumReachedAt", "SomethingElse")
+        assert ggm.check_quorum_branch_is_conditional(_stripped(bad))
+
+
+
+# ---------------------------------------------------------------------------
+# The real contract
+# ---------------------------------------------------------------------------
+
+
+class TestRealGovernanceContract:
+    def test_all_structural_checks_pass(self):
+        source = _stripped(ggm.GOV_LIB.read_text(encoding="utf-8"))
+        problems = []
+        problems.extend(ggm.check_vote_cost_is_signer_independent(source))
+        problems.extend(ggm.check_duplicate_approval_is_o1(source))
+        problems.extend(ggm.check_quorum_branch_is_conditional(source))
+        assert problems == [], f"unexpected problems: {problems}"
+
+    def test_constants_match_the_model(self):
+        source = _stripped(ggm.GOV_LIB.read_text(encoding="utf-8"))
+        for name, expected in (
+            ("MAX_SIGNERS", ggm.MAX_SIGNERS),
+            ("MAX_CALLDATA_BYTES", ggm.MAX_CALLDATA_BYTES),
+            ("MAX_PAGE_SIZE", ggm.MAX_PAGE_SIZE),
+        ):
+            assert ggm.check_constant(source, name, expected) is None
+
+    def test_wrong_constant_is_reported(self):
+        source = _stripped(ggm.GOV_LIB.read_text(encoding="utf-8"))
+        assert ggm.check_constant(source, "MAX_SIGNERS", 999) is not None
+
+    def test_every_entrypoint_is_analysed(self):
+        report, problems = ggm.run_checks()
+        assert problems == []
+        for entry in ("propose", "approve", "execute"):
+            assert report[entry]["total_ops"] > 0, f"{entry} counted no operations"
+
+    def test_vote_emits_two_events_in_the_model(self):
+        """The model reports 2 because it cannot evaluate the condition.
+
+        `approve` always emits `vote_cast`, and additionally emits
+        `proposal_queued` on the vote that reaches threshold. The structural
+        check is what proves the second emit is conditional.
+        """
+        report, _ = ggm.run_checks()
+        assert report["approve"]["counts"]["event_emit"] == 2
+
+    def test_execute_is_the_most_read_heavy_path(self):
+        report, _ = ggm.run_checks()
+        assert report["execute"]["reads"] >= report["approve"]["reads"]
+
+
+class TestEventByteSizing:
+    def test_vote_cast_size_is_pinned(self):
+        assert ggm.VOTE_CAST_BYTES == 284
+
+    def test_proposal_queued_size_is_pinned(self):
+        assert ggm.PROPOSAL_QUEUED_BYTES == 232
+
+    def test_sizes_are_four_byte_aligned(self):
+        assert ggm.VOTE_CAST_BYTES % 4 == 0
+        assert ggm.PROPOSAL_QUEUED_BYTES % 4 == 0
+
+    def test_ten_signer_round_fits_the_event_budget(self):
+        r = ggm.voting_round_event_bytes(10)
+        assert r["total"] == 3072
+        assert r["total"] < ggm.MAX_EVENT_BYTES_PER_TX
+
+    def test_max_signer_round_fits_the_event_budget(self):
+        """Even at MAX_SIGNERS=20 the round stays well inside the limit."""
+        r = ggm.voting_round_event_bytes(ggm.MAX_SIGNERS)
+        assert r["total"] < ggm.MAX_EVENT_BYTES_PER_TX
+
+    def test_event_budget_check_passes(self):
+        assert ggm.check_event_budget() == []
+
+    def test_budget_check_fails_when_events_grow(self, monkeypatch=None):
+        """A much larger per-vote event must be reported, not silently pass."""
+        original = ggm.VOTE_CAST_BYTES
+        try:
+            ggm.VOTE_CAST_BYTES = 2_000
+            problems = ggm.check_event_budget()
+        finally:
+            ggm.VOTE_CAST_BYTES = original
+        assert problems, "an oversized voting round must be reported"
+
+    def test_independent_hand_check_agrees(self):
+        """verify_governance_event_bytes.py recomputes both figures from the
+        XDR definitions without importing the model."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(_ROOT / "script" / "verify_governance_event_bytes.py"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "MATCHES governance-gas-model.py (284 / 232)" in result.stdout
+
+
+class TestDocumentationAgreesWithTheModel:
+    """docs/governance-gas.md must not drift from the numbers the model emits.
+
+    A hand-edited table would rot silently, so the document is checked against
+    the model on every run.
+    """
+
+    @staticmethod
+    def _doc() -> str:
+        return (_ROOT / "docs" / "governance-gas.md").read_text(encoding="utf-8")
+
+    def test_operation_table_matches(self):
+        doc = self._doc()
+        report, problems = ggm.run_checks()
+        assert problems == []
+        for entry, data in report.items():
+            row = (f"| `{entry}` | {data['reads']} | {data['writes']} "
+                   f"| {data['total_ops']} |")
+            assert row in doc, f"docs/governance-gas.md is stale: missing {row}"
+
+    def test_round_arithmetic_matches(self):
+        import re
+
+        doc = re.sub(r"\s+", " ", self._doc())
+        report, _ = ggm.run_checks()
+        total_ops = (
+            report["propose"]["total_ops"]
+            + report["approve"]["total_ops"] * 10
+            + report["execute"]["total_ops"]
+        )
+        assert f"{total_ops} ops" in doc
+        r10 = ggm.voting_round_event_bytes(10)
+        assert f"{r10['total']:,}" in doc
+
+    def test_event_byte_figures_match(self):
+        doc = self._doc()
+        assert f"| `vote_cast` | {ggm.VOTE_CAST_BYTES} |" in doc
+        assert f"| `proposal_queued` | {ggm.PROPOSAL_QUEUED_BYTES} |" in doc
+
+    def test_doc_does_not_claim_instruction_counts(self):
+        import re
+
+        flat = re.sub(r"\s+", " ", self._doc())
+        assert "does **not** contain them" in flat, (
+            "the document must state that measured instruction counts are "
+            "absent, so nobody reads the operation counts as instructions"
+        )
+
+
+class TestScriptRuns:
+    def test_exits_zero_against_the_real_contract(self):
+        result = subprocess.run(
+            [sys.executable, str(_SCRIPT)], capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "NOT instruction counts" in result.stdout
+
+    def test_json_output_is_machine_readable(self):
+        result = subprocess.run(
+            [sys.executable, str(_SCRIPT), "--json"], capture_output=True, text=True
+        )
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is True
+        assert "approve" in payload["report"]
+

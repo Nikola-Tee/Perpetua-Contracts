@@ -1,4 +1,12 @@
-# Factory gas benchmark
+# Gas benchmarks
+
+This file covers the **stream/factory** paths. Governance voting and execution
+are analysed separately in
+[governance-gas.md](governance-gas.md), which measures operation counts and
+event bytes for `propose` / `approve` / `execute` and documents what a
+multi-signer round costs.
+
+## Factory gas benchmark
 
 The factory benchmark compares three first-stream creation paths under the same Stellar Asset Contract, schedule, amount, and ledger state:
 
